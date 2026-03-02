@@ -1,6 +1,6 @@
 {
   "name": "@tracekit/replay",
-  "version": "1.0.0",
+  "version": "0.1.1",
   "description": "TraceKit Session Replay - Privacy-first session recording with rrweb",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -31,7 +31,7 @@
     "fflate": "^0.8.2"
   },
   "peerDependencies": {
-    "@tracekit/browser": "^1.0.0"
+    "@tracekit/browser": "^0.1.1"
   },
   "devDependencies": {
     "typescript": "^5.3.0",
