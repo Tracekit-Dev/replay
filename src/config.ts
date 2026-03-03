@@ -14,7 +14,7 @@ const DEFAULTS = {
   unmask: [] as string[],
   idleTimeout: 1_800_000, // 30 minutes
   flushInterval: 30_000, // 30 seconds
-  maxBufferSize: 10_485_760, // 10MB
+  maxBufferSize: 24_117_248, // 23MB
   inlineImages: false,
   blockMedia: true,
 } as const;

@@ -39,7 +39,7 @@ export interface ReplayConfig {
   /** Flush interval in ms (default: 30000 = 30s) */
   flushInterval?: number;
 
-  /** Max buffer size in bytes (default: 10485760 = 10MB) */
+  /** Max buffer size in bytes (default: 24117248 = 23MB) */
   maxBufferSize?: number;
 
   /**
