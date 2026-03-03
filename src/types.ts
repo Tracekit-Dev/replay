@@ -41,6 +41,21 @@ export interface ReplayConfig {
 
   /** Max buffer size in bytes (default: 10485760 = 10MB) */
   maxBufferSize?: number;
+
+  /**
+   * Inline images as base64 data URIs in the recording.
+   * When true, images are captured and available during replay.
+   * Increases payload size. (default: false)
+   */
+  inlineImages?: boolean;
+
+  /**
+   * Block media elements (img, video, canvas, svg, iframe) from recording.
+   * When true, these elements are replaced with placeholders.
+   * Set to false to capture media element structure (combine with inlineImages
+   * to also capture image content). (default: true)
+   */
+  blockMedia?: boolean;
 }
 
 /** Fully resolved config with all defaults applied */
@@ -51,6 +66,8 @@ export interface ResolvedReplayConfig {
   idleTimeout: number;
   flushInterval: number;
   maxBufferSize: number;
+  inlineImages: boolean;
+  blockMedia: boolean;
   /** Inherited from BrowserClient */
   apiKey: string;
   /** Inherited from BrowserClient */

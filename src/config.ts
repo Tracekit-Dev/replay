@@ -15,6 +15,8 @@ const DEFAULTS = {
   idleTimeout: 1_800_000, // 30 minutes
   flushInterval: 30_000, // 30 seconds
   maxBufferSize: 10_485_760, // 10MB
+  inlineImages: false,
+  blockMedia: true,
 } as const;
 
 /**
@@ -70,6 +72,8 @@ export function resolveReplayConfig(
     idleTimeout: config.idleTimeout ?? DEFAULTS.idleTimeout,
     flushInterval: config.flushInterval ?? DEFAULTS.flushInterval,
     maxBufferSize: config.maxBufferSize ?? DEFAULTS.maxBufferSize,
+    inlineImages: config.inlineImages ?? DEFAULTS.inlineImages,
+    blockMedia: config.blockMedia ?? DEFAULTS.blockMedia,
     apiKey,
     endpoint,
   };

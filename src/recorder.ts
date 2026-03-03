@@ -79,8 +79,8 @@ export function startRecording(
       // Custom mask function: same-length asterisk replacement with unmask support
       maskTextFn: createMaskTextFn(config.unmask),
 
-      // Block all media and embedded content
-      blockSelector: 'img, video, canvas, svg, iframe',
+      // Block media elements (configurable, default: true for privacy)
+      ...(config.blockMedia ? { blockSelector: 'img, video, canvas, svg, iframe' } : {}),
 
       // Do NOT record canvas content
       recordCanvas: false,
@@ -88,8 +88,8 @@ export function startRecording(
       // Do NOT record cross-origin iframes
       recordCrossOriginIframes: false,
 
-      // Do NOT inline images
-      inlineImages: false,
+      // Inline images as base64 (configurable, default: false for privacy/size)
+      inlineImages: config.inlineImages,
 
       // ================================================================
       // Recording lifecycle
