@@ -174,6 +174,15 @@ export function replayIntegration(
           () => session!.getSessionId(),
           () => session!.nextSegmentId(),
           () => (session!.getMode() === 'buffer' ? 'buffer' : 'session'),
+          // URL: current page location
+          () => typeof window !== 'undefined' ? window.location.href : '',
+          // User ID: from browser SDK scope
+          () => {
+            try {
+              const scope = client.getScope();
+              return scope.getUser()?.id || '';
+            } catch { return ''; }
+          },
         );
 
         // Start recording immediately (LOCKED: recording starts on init())

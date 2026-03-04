@@ -32,10 +32,16 @@ export class ReplayTransport {
   private compressionWorker: CompressionWorker;
   private bufferSize = 0;
 
+  // Interaction counters (accumulated across all chunks)
+  private clickCount = 0;
+  private keypressCount = 0;
+
   // Getter functions wired by integration layer
   private sessionIdFn: (() => string) | null = null;
   private segmentIdFn: (() => number) | null = null;
   private replayTypeFn: (() => string) | null = null;
+  private urlFn: (() => string) | null = null;
+  private userIdFn: (() => string) | null = null;
 
   constructor(config: ResolvedReplayConfig, compressionWorker: CompressionWorker) {
     this.config = config;
@@ -55,10 +61,14 @@ export class ReplayTransport {
     getSessionId: () => string,
     nextSegmentId: () => number,
     getReplayType: () => string,
+    getUrl: () => string,
+    getUserId: () => string,
   ): void {
     this.sessionIdFn = getSessionId;
     this.segmentIdFn = nextSegmentId;
     this.replayTypeFn = getReplayType;
+    this.urlFn = getUrl;
+    this.userIdFn = getUserId;
 
     // Start periodic flush at config.flushInterval (default 30s)
     this.flushTimer = setInterval(() => {
@@ -97,6 +107,15 @@ export class ReplayTransport {
    */
   addEvent(event: any): void {
     try {
+      // Count mouse clicks (rrweb IncrementalSnapshot=3, MouseInteraction=2, Click=2)
+      if (event.type === 3 && event.data?.source === 2 && event.data?.type === 2) {
+        this.clickCount++;
+      }
+      // Count keypresses (rrweb IncrementalSnapshot=3, Input=5)
+      if (event.type === 3 && event.data?.source === 5) {
+        this.keypressCount++;
+      }
+
       const eventSize = JSON.stringify(event).length;
       this.pendingEvents.push(event);
       this.bufferSize += eventSize;
@@ -199,12 +218,18 @@ export class ReplayTransport {
       const compressed = gzipSync(encoded, { level: 6 });
 
       // Build URL with query parameters (sendBeacon cannot set custom headers)
+      const replayUrl = this.urlFn ? this.urlFn() : '';
+      const replayUserId = this.userIdFn ? this.userIdFn() : '';
       const url =
         `${this.config.endpoint}/api/replays/${sessionId}/chunks` +
         `?api_key=${encodeURIComponent(this.config.apiKey)}` +
         `&segment_id=${segmentId}` +
         `&original_size=${encoded.length}` +
-        `&replay_type=${replayType}`;
+        `&replay_type=${replayType}` +
+        `&replay_url=${encodeURIComponent(replayUrl)}` +
+        `&replay_user_id=${encodeURIComponent(replayUserId)}` +
+        `&click_count=${this.clickCount}` +
+        `&keypress_count=${this.keypressCount}`;
 
       // Cast through ArrayBuffer to satisfy TypeScript 5.x Uint8Array<ArrayBufferLike> vs BlobPart
       const blob = new Blob([compressed as unknown as BlobPart], { type: 'application/octet-stream' });
@@ -264,6 +289,11 @@ export class ReplayTransport {
             'X-Segment-Id': String(segmentId),
             'X-Original-Size': String(originalSize),
             'X-Replay-Type': replayType,
+            'X-Replay-Url': this.urlFn ? this.urlFn() : '',
+            'X-Replay-User-Id': this.userIdFn ? this.userIdFn() : '',
+            'X-Replay-User-Agent': typeof navigator !== 'undefined' ? navigator.userAgent : '',
+            'X-Click-Count': String(this.clickCount),
+            'X-Keypress-Count': String(this.keypressCount),
           },
           body: compressed as unknown as BodyInit,
         });
