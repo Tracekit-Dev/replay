@@ -1,6 +1,6 @@
 {
   "name": "@tracekit/replay",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "TraceKit Session Replay - Privacy-first session recording with rrweb",
   "type": "module",
   "main": "./dist/index.cjs",

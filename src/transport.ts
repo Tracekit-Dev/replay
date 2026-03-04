@@ -37,9 +37,6 @@ export class ReplayTransport {
   private segmentIdFn: (() => number) | null = null;
   private replayTypeFn: (() => string) | null = null;
 
-  // Visibility change handler (stored for cleanup)
-  private visibilityHandler: (() => void) | null = null;
-
   constructor(config: ResolvedReplayConfig, compressionWorker: CompressionWorker) {
     this.config = config;
     this.compressionWorker = compressionWorker;
@@ -50,8 +47,9 @@ export class ReplayTransport {
   // ---------------------------------------------------------------------------
 
   /**
-   * Start the transport: begin 30-second flush interval and register
-   * visibilitychange listener for sendBeacon fallback on tab close.
+   * Start the transport: begin 30-second flush interval.
+   * Note: visibilitychange-based flushSync is handled by SessionManager's
+   * pauseCallback to avoid duplicate flush calls on tab hide.
    */
   start(
     getSessionId: () => string,
@@ -68,30 +66,15 @@ export class ReplayTransport {
         // Never crash -- flush errors are swallowed
       });
     }, this.config.flushInterval);
-
-    // Register sendBeacon fallback for tab close
-    if (typeof document !== 'undefined') {
-      this.visibilityHandler = () => {
-        if (document.visibilityState === 'hidden') {
-          this.flushSync();
-        }
-      };
-      document.addEventListener('visibilitychange', this.visibilityHandler);
-    }
   }
 
   /**
-   * Stop the transport: clear flush interval and remove listeners.
+   * Stop the transport: clear flush interval.
    */
   stop(): void {
     if (this.flushTimer !== null) {
       clearInterval(this.flushTimer);
       this.flushTimer = null;
-    }
-
-    if (this.visibilityHandler && typeof document !== 'undefined') {
-      document.removeEventListener('visibilitychange', this.visibilityHandler);
-      this.visibilityHandler = null;
     }
   }
 
@@ -283,7 +266,6 @@ export class ReplayTransport {
             'X-Replay-Type': replayType,
           },
           body: compressed as unknown as BodyInit,
-          keepalive: true,
         });
 
         if (response.ok) {
