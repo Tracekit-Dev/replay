@@ -20,18 +20,60 @@ import { RingBuffer } from './buffer';
 // Helpers
 // ---------------------------------------------------------------------------
 
+const SESSION_STORAGE_KEY = '__tracekit_replay_session';
+const SESSION_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
+
 /**
  * Generate a 32-character hex session ID.
  * Prefers crypto.randomUUID() where available, falls back to Math.random().
  */
-function generateSessionId(): string {
+function newSessionId(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
     return crypto.randomUUID().replace(/-/g, '');
   }
-  // Fallback: random hex string
   return Array.from({ length: 32 }, () =>
     Math.floor(Math.random() * 16).toString(16),
   ).join('');
+}
+
+/**
+ * Get or create a session ID, persisting in sessionStorage so it survives
+ * full page reloads in server-rendered (non-SPA) apps.
+ * Returns { sessionId, segmentId, isExisting }
+ */
+function getOrCreateSession(): { sessionId: string; segmentId: number; isExisting: boolean } {
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
+      if (raw) {
+        const stored = JSON.parse(raw);
+        const age = Date.now() - (stored.lastActivity || 0);
+        if (age < SESSION_MAX_AGE_MS && stored.sessionId) {
+          return { sessionId: stored.sessionId, segmentId: stored.segmentId || 0, isExisting: true };
+        }
+      }
+    }
+  } catch {
+    // sessionStorage may be unavailable (private browsing, etc.)
+  }
+  return { sessionId: newSessionId(), segmentId: 0, isExisting: false };
+}
+
+/**
+ * Persist session state to sessionStorage.
+ */
+function persistSession(state: SessionState): void {
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({
+        sessionId: state.sessionId,
+        segmentId: state.segmentId,
+        lastActivity: state.lastActivity,
+      }));
+    }
+  } catch {
+    // Ignore storage errors
+  }
 }
 
 /**
@@ -74,17 +116,19 @@ export class SessionManager {
     this.config = config;
     this.ringBuffer = new RingBuffer(60_000);
 
-    const mode = decideSamplingMode(config);
+    const existing = getOrCreateSession();
+    const mode = existing.isExisting ? 'session' : decideSamplingMode(config);
     const now = Date.now();
 
     this.state = {
-      sessionId: generateSessionId(),
+      sessionId: existing.sessionId,
       mode,
       startedAt: now,
       lastActivity: now,
-      segmentId: 0,
+      segmentId: existing.segmentId,
     };
 
+    persistSession(this.state);
     this.resetIdleTimer();
     this.setupVisibilityListener();
   }
@@ -101,6 +145,7 @@ export class SessionManager {
    */
   onEvent(event: any, _isCheckout: boolean): void {
     this.state.lastActivity = Date.now();
+    persistSession(this.state);
     this.resetIdleTimer();
 
     if (this.state.mode === 'session') {
@@ -242,12 +287,14 @@ export class SessionManager {
     const now = Date.now();
 
     this.state = {
-      sessionId: generateSessionId(),
+      sessionId: newSessionId(),
       mode,
       startedAt: now,
       lastActivity: now,
       segmentId: 0,
     };
+
+    persistSession(this.state);
 
     // 3. Clear the ring buffer for the new session
     this.ringBuffer.clear();
