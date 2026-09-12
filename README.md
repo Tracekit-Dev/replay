@@ -42,7 +42,7 @@ replayIntegration({
 | `sessionSampleRate` | `number` | `0.1` | Percentage of sessions to record (0.0 to 1.0) |
 | `errorSampleRate` | `number` | `0.0` | Capture replay when an error occurs (0.0 to 1.0) |
 | `unmask` | `string[]` | `[]` | CSS selectors for elements to unmask |
-| `idleTimeout` | `number` | `1800000` | Milliseconds of inactivity before session ends (30 min) |
+| `idleTimeout` | `number` | `1800000` | Milliseconds without visible user activity before session ends (30 min) |
 | `flushInterval` | `number` | `30000` | Milliseconds between chunk uploads (30s) |
 | `maxBufferSize` | `number` | `24117248` | Max buffer size in bytes before dropping oldest events (23MB) |
 | `inlineImages` | `boolean` | `false` | Inline images as base64 data URIs in the recording |
