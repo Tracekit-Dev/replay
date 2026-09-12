@@ -154,7 +154,7 @@ export class SessionManager {
    * - off mode: discard
    */
   onEvent(event: any, _isCheckout: boolean): void {
-    if (!this.active) return;
+    if (!this.active || !this.isVisible()) return;
     if (Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
       this.handleIdleTimeout();
       return;
@@ -183,7 +183,7 @@ export class SessionManager {
    * sessions in buffer mode.
    */
   onError(): void {
-    if (this.state.mode === 'buffer' && this.ringBuffer.size > 0) {
+    if (this.active && this.isVisible() && this.state.mode === 'buffer' && this.ringBuffer.size > 0) {
       const events = this.ringBuffer.flush();
       if (this.eventCallback) {
         try {
@@ -194,6 +194,7 @@ export class SessionManager {
       }
       // Switch to full recording mode
       this.state.mode = 'session';
+      persistSession(this.state);
     }
     // session mode or off mode: no-op
   }
@@ -317,11 +318,15 @@ export class SessionManager {
     }
 
     this.active = false;
+    this.ringBuffer.clear();
   }
 
   private renewFromVisibleActivity(): boolean {
     if (!this.isVisible()) return false;
     const now = Date.now();
+    if (this.active && now - this.state.lastActivity >= this.config.idleTimeout) {
+      this.handleIdleTimeout();
+    }
     if (this.active && now - this.state.lastActivity < this.config.idleTimeout) {
       this.state.lastActivity = now;
       persistSession(this.state);
@@ -387,7 +392,7 @@ export class SessionManager {
         if ((event as Event & { isTrusted?: boolean }).isTrusted === false) return;
         this.renewFromVisibleActivity();
       };
-      document.addEventListener(name, handler, { passive: true });
+      document.addEventListener(name, handler, { capture: true, passive: true });
       this.activityHandlers.push([name, handler]);
     }
   }

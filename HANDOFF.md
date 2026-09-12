@@ -12,10 +12,11 @@ Completed:
 - Persisted segment allocation and exposed retained flush identity.
 - Added lifecycle recording window calls, hidden start protection, and deadline wiring.
 - Validated idle timeout values and updated the README.
+- Added fake timer tests for event noise, hidden resume expiry, segment persistence, and listener teardown.
 
 Changed files: `src/session.ts`, `src/index.ts`, `src/config.ts`, `README.md`.
 
-Tests: `npm test` passed. `npm run build` passed.
+Tests: `npm test` passed with 11 tests. `npm run build` passed.
 
 Current blocker: Parent integration must use `getFlushSessionId()` for old-session flushes.
 
