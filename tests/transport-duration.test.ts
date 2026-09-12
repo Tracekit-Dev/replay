@@ -75,6 +75,23 @@ describe('recorded duration boundaries', () => {
     await transport.flush();
     expect(span(chunks[0])).toBe(60000);
   });
+  it('does not count history discarded by the transport size limit', async () => {
+    transport.destroy();
+    const worker = {compress: async (events: any[]) => {
+      chunks.push(events); return {compressed: new Uint8Array([1]), originalSize: 1};
+    }};
+    transport = new ReplayTransport(resolveReplayConfig({maxBufferSize: 70}, 'key', 'https://example.test'), worker as any);
+    mode = 'buffer';
+    transport.start(() => sessionId, () => 0, () => mode, () => '', () => '', () => deadline);
+    transport.stop();
+    transport.startRecordingWindow();
+    transport.addEvent({type: 2, timestamp: epoch});
+    transport.addEvent({type: 3, timestamp: epoch + 1000});
+    mode = 'session';
+    vi.setSystemTime(epoch + 2000);
+    await transport.flush();
+    expect(Math.min(...chunks[0].map(e => e.timestamp))).toBe(epoch + 1000);
+  });
   it('writes the same boundaries in the page-hide beacon', async () => {
     let blob: Blob | undefined;
     vi.stubGlobal('navigator', { sendBeacon: vi.fn((_url, data) => {blob = data; return true;}) });

@@ -168,6 +168,10 @@ export class ReplayTransport {
             // Ignore sizing errors on drop
           }
         }
+        const firstTimestamp = this.pendingEvents[0]?.timestamp;
+        if (this.recordingWindowStart !== null && Number.isFinite(firstTimestamp)) {
+          this.recordingWindowStart = Math.max(this.recordingWindowStart, firstTimestamp);
+        }
         if (this.config.maxBufferSize > 0) {
           console.warn('[TraceKit Replay] Buffer exceeded maxBufferSize, dropping oldest events');
         }
