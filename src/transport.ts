@@ -31,6 +31,8 @@ export class ReplayTransport {
   private config: ResolvedReplayConfig;
   private compressionWorker: CompressionWorker;
   private bufferSize = 0;
+  private recordingWindowStart: number | null = null;
+  private recordingDeadlineFn: (() => number) | null = null;
 
   // Interaction counters (accumulated across all chunks)
   private clickCount = 0;
@@ -63,12 +65,14 @@ export class ReplayTransport {
     getReplayType: () => string,
     getUrl: () => string,
     getUserId: () => string,
+    getRecordingDeadline?: () => number,
   ): void {
     this.sessionIdFn = getSessionId;
     this.segmentIdFn = nextSegmentId;
     this.replayTypeFn = getReplayType;
     this.urlFn = getUrl;
     this.userIdFn = getUserId;
+    this.recordingDeadlineFn = getRecordingDeadline ?? null;
 
     // Start periodic flush at config.flushInterval (default 30s)
     this.flushTimer = setInterval(() => {
@@ -95,6 +99,35 @@ export class ReplayTransport {
     this.stop();
     this.pendingEvents = [];
     this.bufferSize = 0;
+    this.recordingWindowStart = null;
+  }
+
+  /** Start a visible recorder interval. Hidden time never belongs to a chunk. */
+  startRecordingWindow(): void {
+    this.recordingWindowStart = Date.now();
+  }
+
+  /** Close the interval before stopping, hiding, or changing session identity. */
+  stopRecordingWindow(): void {
+    this.appendRecordingBoundaries();
+    this.recordingWindowStart = null;
+  }
+
+  private appendRecordingBoundaries(): void {
+    if (this.recordingWindowStart === null) return;
+    const mode = this.replayTypeFn?.() ?? 'session';
+    // Error-only recording must not upload until the error buffer is released.
+    if (mode !== 'session' && this.pendingEvents.length === 0) return;
+    const deadline = this.recordingDeadlineFn?.() ?? Date.now();
+    const end = Math.min(Date.now(), deadline);
+    const start = Math.min(this.recordingWindowStart, end);
+    const boundary = (kind: string, timestamp: number) => ({
+      type: 5, timestamp,
+      data: { tag: 'tracekit.recording-boundary', payload: { kind } },
+    });
+    this.pendingEvents.unshift(boundary('start', start));
+    this.pendingEvents.push(boundary('end', end));
+    this.recordingWindowStart = end;
   }
 
   // ---------------------------------------------------------------------------
@@ -107,6 +140,11 @@ export class ReplayTransport {
    */
   addEvent(event: any): void {
     try {
+      // An error buffer begins at its oldest retained event, not recorder start.
+      if (this.pendingEvents.length === 0 && this.replayTypeFn?.() === 'buffer' &&
+          Number.isFinite(event.timestamp)) {
+        this.recordingWindowStart = event.timestamp;
+      }
       // Count mouse clicks (rrweb IncrementalSnapshot=3, MouseInteraction=2, Click=2)
       if (event.type === 3 && event.data?.source === 2 && event.data?.type === 2) {
         this.clickCount++;
@@ -157,6 +195,7 @@ export class ReplayTransport {
    * Returns silently if no events are pending.
    */
   async flush(): Promise<void> {
+    this.appendRecordingBoundaries();
     if (this.pendingEvents.length === 0) {
       return;
     }
@@ -174,11 +213,13 @@ export class ReplayTransport {
         return; // No session -- discard events
       }
 
+      const headers = this.uploadHeaders(segmentId);
+
       // Compress via worker (or main-thread fallback)
       const { compressed, originalSize } = await this.compressionWorker.compress(events, segmentId);
 
       // Upload with retry
-      await this.uploadWithRetry(sessionId, segmentId, compressed, originalSize);
+      await this.uploadWithRetry(sessionId, compressed, originalSize, headers);
     } catch {
       // Drop chunk on any unexpected error -- replay data loss is acceptable
     }
@@ -195,6 +236,7 @@ export class ReplayTransport {
    * If both fail, data is lost (acceptable for replay).
    */
   flushSync(): void {
+    this.appendRecordingBoundaries();
     if (this.pendingEvents.length === 0) {
       return;
     }
@@ -272,29 +314,16 @@ export class ReplayTransport {
    */
   private async uploadWithRetry(
     sessionId: string,
-    segmentId: number,
     compressed: Uint8Array,
     originalSize: number,
+    headers: Record<string, string>,
   ): Promise<void> {
     const url = `${this.config.endpoint}/api/replays/${sessionId}/chunks`;
-    const replayType = this.replayTypeFn ? this.replayTypeFn() : 'session';
-
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       try {
         const response = await fetch(url, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/octet-stream',
-            'X-API-Key': this.config.apiKey,
-            'X-Segment-Id': String(segmentId),
-            'X-Original-Size': String(originalSize),
-            'X-Replay-Type': replayType,
-            'X-Replay-Url': this.urlFn ? this.urlFn() : '',
-            'X-Replay-User-Id': this.userIdFn ? this.userIdFn() : '',
-            'X-Replay-User-Agent': typeof navigator !== 'undefined' ? navigator.userAgent : '',
-            'X-Click-Count': String(this.clickCount),
-            'X-Keypress-Count': String(this.keypressCount),
-          },
+          headers: { ...headers, 'X-Original-Size': String(originalSize) },
           body: compressed as unknown as BodyInit,
         });
 
@@ -320,6 +349,21 @@ export class ReplayTransport {
     }
 
     // All attempts exhausted -- drop chunk (replay data loss is acceptable)
+  }
+
+  /** Capture metadata before compression or retries can cross a session boundary. */
+  private uploadHeaders(segmentId: number): Record<string, string> {
+    return {
+      'Content-Type': 'application/octet-stream',
+      'X-API-Key': this.config.apiKey,
+      'X-Segment-Id': String(segmentId),
+      'X-Replay-Type': this.replayTypeFn?.() ?? 'session',
+      'X-Replay-Url': this.urlFn?.() ?? '',
+      'X-Replay-User-Id': this.userIdFn?.() ?? '',
+      'X-Replay-User-Agent': typeof navigator !== 'undefined' ? navigator.userAgent : '',
+      'X-Click-Count': String(this.clickCount),
+      'X-Keypress-Count': String(this.keypressCount),
+    };
   }
 
   /**
