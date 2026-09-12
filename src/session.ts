@@ -188,7 +188,16 @@ export class SessionManager {
       return;
     }
     if (this.active && this.isVisible() && this.state.mode === 'buffer') {
-      const events = this.ringBuffer.flush();
+      let events = this.ringBuffer.flush();
+      // A delayed error can leave no usable baseline after stale eviction.
+      // Start a fresh snapshot while still in buffer mode, then flush it.
+      if (!events.some((event) => event?.type === 2)) {
+        this.ringBuffer.clear();
+        if (this.restartCallback) {
+          try { this.restartCallback(); } catch { /* Never crash the host app */ }
+        }
+        events = this.ringBuffer.flush();
+      }
       if (events.length > 0 && this.eventCallback) {
         try {
           this.eventCallback(events);

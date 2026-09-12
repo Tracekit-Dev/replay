@@ -128,4 +128,26 @@ describe('SessionManager lifecycle', () => {
     expect(manager.getSessionId()).not.toBe(oldId);
     manager.destroy();
   });
+
+  it('creates a fresh baseline when a delayed buffer error has no retained events', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.stubGlobal('document', doc);
+    vi.stubGlobal('sessionStorage', { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) });
+    const manager = new SessionManager({ ...config(), sessionSampleRate: 0, errorSampleRate: 1, idleTimeout: 120_000 });
+    const emitted: any[] = [];
+    let restarts = 0;
+    manager.setEventCallback((events) => emitted.push(...events));
+    manager.setRestartCallback(() => {
+      restarts++;
+      manager.onEvent({ type: 2, timestamp: Date.now() }, false);
+    });
+    manager.onEvent({ type: 3, timestamp: 0 }, false);
+    vi.setSystemTime(61_000);
+    manager.onError();
+    expect(restarts).toBe(1);
+    expect(emitted.some((event) => event.type === 2)).toBe(true);
+    expect(manager.getMode()).toBe('session');
+    manager.destroy();
+  });
 });
