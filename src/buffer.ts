@@ -31,6 +31,9 @@ export class RingBuffer {
    * Returns the raw rrweb events (unwrapped from the timestamp envelope).
    */
   flush(): any[] {
+    // Timers can be suspended while the page is hidden.
+    // Evict before flushing so stale events never enter a replay.
+    this.evictExpired();
     const flushed = this.events.map((e) => e.event);
     this.events = [];
     return flushed;

@@ -187,9 +187,9 @@ export class SessionManager {
       this.handleIdleTimeout();
       return;
     }
-    if (this.active && this.isVisible() && this.state.mode === 'buffer' && this.ringBuffer.size > 0) {
+    if (this.active && this.isVisible() && this.state.mode === 'buffer') {
       const events = this.ringBuffer.flush();
-      if (this.eventCallback) {
+      if (events.length > 0 && this.eventCallback) {
         try {
           this.eventCallback(events);
         } catch {
