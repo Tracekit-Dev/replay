@@ -68,6 +68,7 @@ export function replayIntegration(
 
         const start = () => {
           if (!session || !resolvedConfig || !session.isActive() || !session.isVisible() || session.getMode() === 'off') return;
+          if (stopRecording) return;
           transport!.startRecordingWindow();
           stopRecording = startRecording(resolvedConfig, (event, isCheckout) => {
             session?.onEvent(event, isCheckout);
@@ -179,7 +180,7 @@ export function replayIntegration(
 
         // Start transport (30-second flush interval)
         transport.start(
-          () => session!.getSessionId(),
+          () => session!.getFlushSessionId(),
           () => session!.nextSegmentId(),
           () => session!.getMode(),
           // URL: current page location
@@ -208,7 +209,9 @@ export function replayIntegration(
     teardown(): void {
       try {
         if (stopRecording) {
-          stop();
+          stopRecording();
+          stopRecording = null;
+          transport?.stopRecordingWindow();
         } else {
           transport?.stopRecordingWindow();
         }

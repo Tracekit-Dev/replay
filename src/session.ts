@@ -183,6 +183,10 @@ export class SessionManager {
    * sessions in buffer mode.
    */
   onError(): void {
+    if (this.active && Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
+      this.handleIdleTimeout();
+      return;
+    }
     if (this.active && this.isVisible() && this.state.mode === 'buffer' && this.ringBuffer.size > 0) {
       const events = this.ringBuffer.flush();
       if (this.eventCallback) {
@@ -239,6 +243,9 @@ export class SessionManager {
 
   /** Current session ID */
   getSessionId(): string {
+    if (this.active && Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
+      this.handleIdleTimeout();
+    }
     return this.active && this.state.mode !== 'off' ? this.state.sessionId : '';
   }
 
@@ -292,7 +299,6 @@ export class SessionManager {
     if (this.idleTimer !== null) {
       clearTimeout(this.idleTimer);
     }
-
     this.idleTimer = setTimeout(() => {
       this.handleIdleTimeout();
     }, this.config.idleTimeout);
@@ -405,6 +411,7 @@ export class SessionManager {
    * Tear down the session manager: clear timers, remove listeners, clear buffer.
    */
   destroy(): void {
+    this.active = false;
     if (this.idleTimer !== null) {
       clearTimeout(this.idleTimer);
       this.idleTimer = null;
@@ -416,7 +423,7 @@ export class SessionManager {
     }
 
     if (typeof document !== 'undefined') {
-      for (const [name, handler] of this.activityHandlers) document.removeEventListener(name, handler);
+      for (const [name, handler] of this.activityHandlers) document.removeEventListener(name, handler, { capture: true });
     }
     this.activityHandlers = [];
 
