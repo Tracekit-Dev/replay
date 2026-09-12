@@ -79,3 +79,17 @@ Full documentation: https://app.tracekit.dev/docs/frontend/session-replay
 ## License
 
 MIT
+
+### Recorded duration (0.3.4)
+
+Replay uploads include timestamp boundaries for each visible recording interval.
+The server uses these intervals to exclude hidden periods and upload delays from duration.
+This measures recorded time, not Analytics engagement time.
+Deploy the server duration migration before publishing this package.
+Older uploads without boundaries keep an unknown duration.
+The server also marks chunks longer than 30 minutes as unknown.
+Keep `flushInterval` below that limit (default: 30 seconds).
+
+For the real Chromium lifecycle test, run `npm run build`, then
+`node tests/browser-lifecycle.integration.mjs` with Playwright installed.
+Set `PLAYWRIGHT_MODULE` to its module path when using an external installation.
