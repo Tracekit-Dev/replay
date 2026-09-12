@@ -2,7 +2,7 @@
 
 Status: READY_FOR_REVIEW
 
-Last commit: pending checkpoint
+Last commit: 334f96d
 
 Completed:
 
@@ -13,11 +13,12 @@ Completed:
 - Added lifecycle recording window calls, hidden start protection, and deadline wiring.
 - Validated idle timeout values and updated the README.
 - Added fake timer tests for event noise, hidden resume expiry, segment persistence, and listener teardown.
+- Evicted stale ring buffer entries during delayed flushes and allowed empty buffer promotion.
 
 Changed files: `src/session.ts`, `src/index.ts`, `src/config.ts`, `README.md`.
 
-Tests: `npm test` passed with 11 tests. `npm run build` passed.
+Tests: `npm test` passed with 15 tests. `npm run build` passed.
 
-Current blocker: Parent integration must use `getFlushSessionId()` for old-session flushes.
+Current blocker: None.
 
-Next action: Parent reviews and integrates the lifecycle API with transport flush behavior.
+Next action: Parent reviews commits `b4580b8`, `c9c5119`, `c18b603`, and `334f96d`.
