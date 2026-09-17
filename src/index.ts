@@ -60,16 +60,28 @@ export function replayIntegration(
         // Create session manager (makes sampling decision)
         session = new SessionManager(resolvedConfig);
 
-        // If mode is 'off', don't set up recording pipeline
-        if (session.getMode() === 'off') {
-          return;
-        }
-
         // Create compression worker (Web Worker with main-thread fallback)
         compressionWorker = new CompressionWorker();
 
         // Create transport (30-second flush interval, retry, sendBeacon fallback)
         transport = new ReplayTransport(resolvedConfig, compressionWorker);
+
+        const start = () => {
+          if (!session || !resolvedConfig || !session.isActive() || !session.isVisible() || session.getMode() === 'off') return;
+          if (stopRecording) return;
+          transport!.startRecordingWindow();
+          stopRecording = startRecording(resolvedConfig, (event, isCheckout) => {
+            session?.onEvent(event, isCheckout);
+          });
+          if (!stopRecording) transport!.stopRecordingWindow();
+        };
+        const stop = () => {
+          if (stopRecording) {
+            stopRecording();
+            stopRecording = null;
+          }
+          transport?.stopRecordingWindow();
+        };
 
         // Wire session -> transport: events flow from session to transport
         session.setEventCallback((events: any[]) => {
@@ -145,35 +157,32 @@ export function replayIntegration(
 
         // Wire idle timeout restart: stop recording, start fresh with new snapshot
         session.setRestartCallback(() => {
-          if (stopRecording) {
-            stopRecording();
-          }
-          stopRecording = startRecording(resolvedConfig!, (event, isCheckout) => {
-            session?.onEvent(event, isCheckout);
-          });
+          stop();
+          start();
+        });
+
+        session.setIdleStopCallback(() => {
+          stop();
         });
 
         // Wire visibility pause: stop recording and flush sync on tab hide
         session.setPauseCallback(() => {
           if (stopRecording) {
-            stopRecording();
-            stopRecording = null;
+            stop();
           }
           transport?.flushSync();
         });
 
         // Wire visibility resume: restart recording on tab show
         session.setResumeCallback(() => {
-          stopRecording = startRecording(resolvedConfig!, (event, isCheckout) => {
-            session?.onEvent(event, isCheckout);
-          });
+          start();
         });
 
         // Start transport (30-second flush interval)
         transport.start(
-          () => session!.getSessionId(),
+          () => session!.getFlushSessionId(),
           () => session!.nextSegmentId(),
-          () => (session!.getMode() === 'buffer' ? 'buffer' : 'session'),
+          () => session!.getMode(),
           // URL: current page location
           () => typeof window !== 'undefined' ? window.location.href : '',
           // User ID: from browser SDK scope
@@ -183,12 +192,11 @@ export function replayIntegration(
               return scope.getUser()?.id || '';
             } catch { return ''; }
           },
+          () => session!.getState().lastActivity + resolvedConfig!.idleTimeout,
         );
 
         // Start recording immediately (LOCKED: recording starts on init())
-        stopRecording = startRecording(resolvedConfig, (event, isCheckout) => {
-          session!.onEvent(event, isCheckout);
-        });
+        start();
       } catch (err) {
         console.warn('[TraceKit Replay] Failed to initialize replay recording:', err);
       }
@@ -203,6 +211,9 @@ export function replayIntegration(
         if (stopRecording) {
           stopRecording();
           stopRecording = null;
+          transport?.stopRecordingWindow();
+        } else {
+          transport?.stopRecordingWindow();
         }
         transport?.destroy();
         compressionWorker?.destroy();

@@ -42,7 +42,7 @@ replayIntegration({
 | `sessionSampleRate` | `number` | `0.1` | Percentage of sessions to record (0.0 to 1.0) |
 | `errorSampleRate` | `number` | `0.0` | Capture replay when an error occurs (0.0 to 1.0) |
 | `unmask` | `string[]` | `[]` | CSS selectors for elements to unmask |
-| `idleTimeout` | `number` | `1800000` | Milliseconds of inactivity before session ends (30 min) |
+| `idleTimeout` | `number` | `1800000` | Milliseconds without visible user activity before session ends (30 min) |
 | `flushInterval` | `number` | `30000` | Milliseconds between chunk uploads (30s) |
 | `maxBufferSize` | `number` | `24117248` | Max buffer size in bytes before dropping oldest events (23MB) |
 | `inlineImages` | `boolean` | `false` | Inline images as base64 data URIs in the recording |
@@ -79,3 +79,17 @@ Full documentation: https://app.tracekit.dev/docs/frontend/session-replay
 ## License
 
 MIT
+
+### Recorded duration (0.3.4)
+
+Replay uploads include timestamp boundaries for each visible recording interval.
+The server uses these intervals to exclude hidden periods and upload delays from duration.
+This measures recorded time, not Analytics engagement time.
+Deploy the server duration migration before publishing this package.
+Older uploads without boundaries keep an unknown duration.
+The server also marks chunks longer than 30 minutes as unknown.
+Keep `flushInterval` below that limit (default: 30 seconds).
+
+For the real Chromium lifecycle test, run `npm run build`, then
+`node tests/browser-lifecycle.integration.mjs` with Playwright installed.
+Set `PLAYWRIGHT_MODULE` to its module path when using an external installation.

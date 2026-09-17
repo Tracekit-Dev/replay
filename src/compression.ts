@@ -24,6 +24,7 @@ export class CompressionWorker {
   private worker: Worker | null = null;
   private pendingCallbacks = new Map<number, PendingCompression>();
   private useMainThread = false;
+  private nextRequestId = 0;
 
   constructor() {
     this.initWorker();
@@ -66,7 +67,12 @@ export class CompressionWorker {
           '[TraceKit Replay] Web Worker failed to initialize. Using main-thread compression.',
         );
         this.useMainThread = true;
+        this.worker?.terminate();
         this.worker = null;
+        for (const pending of this.pendingCallbacks.values()) {
+          this.compressMainThread(pending.events).then(pending.resolve).catch(pending.reject);
+        }
+        this.pendingCallbacks.clear();
       };
     } catch {
       // CSP or other restriction prevents worker creation
@@ -87,7 +93,7 @@ export class CompressionWorker {
    */
   async compress(
     events: any[],
-    segmentId: number,
+    _segmentId: number,
   ): Promise<{ compressed: Uint8Array; originalSize: number }> {
     if (this.useMainThread || !this.worker) {
       return this.compressMainThread(events);
@@ -95,8 +101,15 @@ export class CompressionWorker {
 
     return new Promise((resolve, reject) => {
       const entry: PendingCompression = { resolve, reject, events };
-      this.pendingCallbacks.set(segmentId, entry);
-      this.worker!.postMessage({ events, segmentId });
+      // Session segment numbers restart at zero; worker requests never reuse them.
+      const requestId = this.nextRequestId++;
+      this.pendingCallbacks.set(requestId, entry);
+      try {
+        this.worker!.postMessage({ events, segmentId: requestId });
+      } catch {
+        this.pendingCallbacks.delete(requestId);
+        this.compressMainThread(events).then(resolve).catch(reject);
+      }
     });
   }
 
@@ -120,6 +133,9 @@ export class CompressionWorker {
     if (this.worker) {
       this.worker.terminate();
       this.worker = null;
+    }
+    for (const pending of this.pendingCallbacks.values()) {
+      pending.reject(new Error('Replay compression worker destroyed'));
     }
     this.pendingCallbacks.clear();
   }

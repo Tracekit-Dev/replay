@@ -19,6 +19,26 @@ const DEFAULTS = {
   blockMedia: true,
 } as const;
 
+const MIN_IDLE_TIMEOUT_MS = 1_000;
+const MAX_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+function resolveIdleTimeout(value: number | undefined): number {
+  if (value === undefined) return DEFAULTS.idleTimeout;
+  if (!Number.isFinite(value) || value <= 0) {
+    console.warn(`[TraceKit Replay] idleTimeout (${value}) is invalid, using ${DEFAULTS.idleTimeout}`);
+    return DEFAULTS.idleTimeout;
+  }
+  if (value < MIN_IDLE_TIMEOUT_MS) {
+    console.warn(`[TraceKit Replay] idleTimeout (${value}) is below ${MIN_IDLE_TIMEOUT_MS}, clamping`);
+    return MIN_IDLE_TIMEOUT_MS;
+  }
+  if (value > MAX_IDLE_TIMEOUT_MS) {
+    console.warn(`[TraceKit Replay] idleTimeout (${value}) is above ${MAX_IDLE_TIMEOUT_MS}, clamping`);
+    return MAX_IDLE_TIMEOUT_MS;
+  }
+  return value;
+}
+
 /**
  * Clamp a value to the [min, max] range, logging a warning if clamped.
  */
@@ -69,7 +89,7 @@ export function resolveReplayConfig(
     sessionSampleRate,
     errorSampleRate,
     unmask: config.unmask ?? DEFAULTS.unmask,
-    idleTimeout: config.idleTimeout ?? DEFAULTS.idleTimeout,
+    idleTimeout: resolveIdleTimeout(config.idleTimeout),
     flushInterval: config.flushInterval ?? DEFAULTS.flushInterval,
     maxBufferSize: config.maxBufferSize ?? DEFAULTS.maxBufferSize,
     inlineImages: config.inlineImages ?? DEFAULTS.inlineImages,

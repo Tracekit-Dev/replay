@@ -21,7 +21,6 @@ import { RingBuffer } from './buffer';
 // ---------------------------------------------------------------------------
 
 const SESSION_STORAGE_KEY = '__tracekit_replay_session';
-const SESSION_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
 
 /**
  * Generate a 32-character hex session ID.
@@ -41,22 +40,27 @@ function newSessionId(): string {
  * full page reloads in server-rendered (non-SPA) apps.
  * Returns { sessionId, segmentId, isExisting }
  */
-function getOrCreateSession(): { sessionId: string; segmentId: number; isExisting: boolean } {
+function getOrCreateSession(config: ResolvedReplayConfig): { sessionId: string; segmentId: number; mode: ReplayMode; isExisting: boolean } {
   try {
     if (typeof sessionStorage !== 'undefined') {
       const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
       if (raw) {
         const stored = JSON.parse(raw);
-        const age = Date.now() - (stored.lastActivity || 0);
-        if (age < SESSION_MAX_AGE_MS && stored.sessionId) {
-          return { sessionId: stored.sessionId, segmentId: stored.segmentId || 0, isExisting: true };
+        const segmentId = stored.segmentId;
+        const mode = stored.mode;
+        const age = Date.now() - Number(stored.lastActivity);
+        if (stored.sessionId && typeof stored.sessionId === 'string' &&
+            Number.isInteger(segmentId) && segmentId >= 0 &&
+            (mode === 'session' || mode === 'buffer' || mode === 'off') &&
+            Number.isFinite(age) && age >= 0 && age < config.idleTimeout) {
+          return { sessionId: stored.sessionId, segmentId, mode, isExisting: true };
         }
       }
     }
   } catch {
     // sessionStorage may be unavailable (private browsing, etc.)
   }
-  return { sessionId: newSessionId(), segmentId: 0, isExisting: false };
+  return { sessionId: newSessionId(), segmentId: 0, mode: decideSamplingMode(config), isExisting: false };
 }
 
 /**
@@ -68,6 +72,7 @@ function persistSession(state: SessionState): void {
       sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({
         sessionId: state.sessionId,
         segmentId: state.segmentId,
+        mode: state.mode,
         lastActivity: state.lastActivity,
       }));
     }
@@ -105,6 +110,9 @@ export class SessionManager {
   private restartCallback: (() => void) | null = null;
   private pauseCallback: (() => void) | null = null;
   private resumeCallback: (() => void) | null = null;
+  private idleStopCallback: (() => void) | null = null;
+  private activityHandlers: Array<[string, (event: Event) => void]> = [];
+  private active = true;
 
   // Idle timeout handle
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -116,8 +124,8 @@ export class SessionManager {
     this.config = config;
     this.ringBuffer = new RingBuffer(60_000);
 
-    const existing = getOrCreateSession();
-    const mode = existing.isExisting ? 'session' : decideSamplingMode(config);
+    const existing = getOrCreateSession(config);
+    const mode = existing.mode;
     const now = Date.now();
 
     this.state = {
@@ -128,9 +136,11 @@ export class SessionManager {
       segmentId: existing.segmentId,
     };
 
+    this.active = this.isVisible();
     persistSession(this.state);
-    this.resetIdleTimer();
+    if (this.active) this.resetIdleTimer();
     this.setupVisibilityListener();
+    this.setupActivityListeners();
   }
 
   // -------------------------------------------------------------------------
@@ -144,9 +154,11 @@ export class SessionManager {
    * - off mode: discard
    */
   onEvent(event: any, _isCheckout: boolean): void {
-    this.state.lastActivity = Date.now();
-    persistSession(this.state);
-    this.resetIdleTimer();
+    if (!this.active || !this.isVisible()) return;
+    if (Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
+      this.handleIdleTimeout();
+      return;
+    }
 
     if (this.state.mode === 'session') {
       if (this.eventCallback) {
@@ -171,9 +183,22 @@ export class SessionManager {
    * sessions in buffer mode.
    */
   onError(): void {
-    if (this.state.mode === 'buffer' && this.ringBuffer.size > 0) {
-      const events = this.ringBuffer.flush();
-      if (this.eventCallback) {
+    if (this.active && Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
+      this.handleIdleTimeout();
+      return;
+    }
+    if (this.active && this.isVisible() && this.state.mode === 'buffer') {
+      let events = this.ringBuffer.flush();
+      // A delayed error can leave no usable baseline after stale eviction.
+      // Start a fresh snapshot while still in buffer mode, then flush it.
+      if (!events.some((event) => event?.type === 2)) {
+        this.ringBuffer.clear();
+        if (this.restartCallback) {
+          try { this.restartCallback(); } catch { /* Never crash the host app */ }
+        }
+        events = this.ringBuffer.flush();
+      }
+      if (events.length > 0 && this.eventCallback) {
         try {
           this.eventCallback(events);
         } catch {
@@ -182,6 +207,7 @@ export class SessionManager {
       }
       // Switch to full recording mode
       this.state.mode = 'session';
+      persistSession(this.state);
     }
     // session mode or off mode: no-op
   }
@@ -215,14 +241,28 @@ export class SessionManager {
     this.resumeCallback = cb;
   }
 
+  /** Set callback called before an idle-session flush. */
+  setIdleStopCallback(cb: () => void): void {
+    this.idleStopCallback = cb;
+  }
+
   // -------------------------------------------------------------------------
   // Accessors
   // -------------------------------------------------------------------------
 
   /** Current session ID */
   getSessionId(): string {
-    return this.state.sessionId;
+    if (this.active && Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
+      this.handleIdleTimeout();
+    }
+    return this.active && this.state.mode !== 'off' ? this.state.sessionId : '';
   }
+
+  /** Return the retained identity needed while flushing an inactive session. */
+  getFlushSessionId(): string { return this.state.sessionId; }
+
+  isActive(): boolean { return this.active; }
+  isVisible(): boolean { return typeof document === 'undefined' || document.visibilityState === 'visible'; }
 
   /** Current recording mode */
   getMode(): ReplayMode {
@@ -231,7 +271,9 @@ export class SessionManager {
 
   /** Return and increment segment counter */
   nextSegmentId(): number {
-    return this.state.segmentId++;
+    const next = this.state.segmentId++;
+    persistSession(this.state);
+    return next;
   }
 
   /** Get full session state */
@@ -266,14 +308,22 @@ export class SessionManager {
     if (this.idleTimer !== null) {
       clearTimeout(this.idleTimer);
     }
-
     this.idleTimer = setTimeout(() => {
       this.handleIdleTimeout();
     }, this.config.idleTimeout);
   }
 
   private handleIdleTimeout(): void {
-    // 1. Flush pending events for old session
+    if (!this.active || Date.now() - this.state.lastActivity < this.config.idleTimeout) {
+      if (this.active) this.resetIdleTimer();
+      return;
+    }
+
+    this.idleTimer = null;
+    // Stop the recorder before flushing the retained old identity.
+    if (this.idleStopCallback) {
+      try { this.idleStopCallback(); } catch { /* Never crash the host app */ }
+    }
     if (this.flushCallback) {
       try {
         this.flushCallback();
@@ -282,31 +332,32 @@ export class SessionManager {
       }
     }
 
-    // 2. Generate new session ID and reset state
-    const mode = decideSamplingMode(this.config);
-    const now = Date.now();
-
-    this.state = {
-      sessionId: newSessionId(),
-      mode,
-      startedAt: now,
-      lastActivity: now,
-      segmentId: 0,
-    };
-
-    persistSession(this.state);
-
-    // 3. Clear the ring buffer for the new session
+    this.active = false;
     this.ringBuffer.clear();
+  }
 
-    // 4. Trigger new full snapshot
-    if (this.restartCallback) {
-      try {
-        this.restartCallback();
-      } catch {
-        // Never crash the host app
-      }
+  private renewFromVisibleActivity(): boolean {
+    if (!this.isVisible()) return false;
+    const now = Date.now();
+    if (this.active && now - this.state.lastActivity >= this.config.idleTimeout) {
+      this.handleIdleTimeout();
     }
+    if (this.active && now - this.state.lastActivity < this.config.idleTimeout) {
+      this.state.lastActivity = now;
+      persistSession(this.state);
+      this.resetIdleTimer();
+      return false;
+    }
+
+    this.state = { sessionId: newSessionId(), mode: decideSamplingMode(this.config), startedAt: now, lastActivity: now, segmentId: 0 };
+    this.active = true;
+    this.ringBuffer.clear();
+    persistSession(this.state);
+    this.resetIdleTimer();
+    if (this.state.mode !== 'off' && this.restartCallback) {
+      try { this.restartCallback(); } catch { /* Never crash the host app */ }
+    }
+    return true;
   }
 
   // -------------------------------------------------------------------------
@@ -332,11 +383,10 @@ export class SessionManager {
             // Never crash the host app
           }
         }
+        this.ringBuffer.clear();
       } else if (document.visibilityState === 'visible') {
-        // Resume: restart recording with new full snapshot
-        this.state.lastActivity = Date.now();
-        this.resetIdleTimer();
-        if (this.resumeCallback) {
+        const startedNewSession = this.renewFromVisibleActivity();
+        if (!startedNewSession && this.active && this.state.mode !== 'off' && this.resumeCallback) {
           try {
             this.resumeCallback();
           } catch {
@@ -349,6 +399,19 @@ export class SessionManager {
     document.addEventListener('visibilitychange', this.visibilityHandler);
   }
 
+  private setupActivityListeners(): void {
+    if (typeof document === 'undefined') return;
+    const names = ['pointerdown', 'pointerup', 'keydown', 'touchstart', 'touchend', 'wheel', 'click', 'input', 'change', 'submit'];
+    for (const name of names) {
+      const handler = (event: Event) => {
+        if ((event as Event & { isTrusted?: boolean }).isTrusted === false) return;
+        this.renewFromVisibleActivity();
+      };
+      document.addEventListener(name, handler, { capture: true, passive: true });
+      this.activityHandlers.push([name, handler]);
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Cleanup
   // -------------------------------------------------------------------------
@@ -357,6 +420,7 @@ export class SessionManager {
    * Tear down the session manager: clear timers, remove listeners, clear buffer.
    */
   destroy(): void {
+    this.active = false;
     if (this.idleTimer !== null) {
       clearTimeout(this.idleTimer);
       this.idleTimer = null;
@@ -367,6 +431,11 @@ export class SessionManager {
       this.visibilityHandler = null;
     }
 
+    if (typeof document !== 'undefined') {
+      for (const [name, handler] of this.activityHandlers) document.removeEventListener(name, handler, { capture: true });
+    }
+    this.activityHandlers = [];
+
     this.ringBuffer.clear();
 
     this.eventCallback = null;
@@ -374,5 +443,6 @@ export class SessionManager {
     this.restartCallback = null;
     this.pauseCallback = null;
     this.resumeCallback = null;
+    this.idleStopCallback = null;
   }
 }
