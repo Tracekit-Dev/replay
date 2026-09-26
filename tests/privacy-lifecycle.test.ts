@@ -1,12 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { replayIntegration } from '../src/index';
 import { SessionManager } from '../src/session';
+import { CompressionWorker } from '../src/compression';
+import { ReplayTransport } from '../src/transport';
 
-const recorder = vi.hoisted(() => ({ starts: 0, stops: 0, emit: null as null | ((event: any, checkout: boolean) => void) }));
+const recorder = vi.hoisted(() => ({ starts: 0, stops: 0, failStart: false, emit: null as null | ((event: any, checkout: boolean) => void) }));
 vi.mock('../src/recorder', () => ({
   startRecording: vi.fn((_config, emit) => {
     recorder.starts++;
     recorder.emit = emit;
+    if (recorder.failStart) return null;
     return () => { recorder.stops++; };
   }),
 }));
@@ -36,10 +39,45 @@ function client(enabled = true, withSubscription = true, withTag = true) {
   };
 }
 
-beforeEach(() => { recorder.starts = 0; recorder.stops = 0; recorder.emit = null; });
-afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+beforeEach(() => { recorder.starts = 0; recorder.stops = 0; recorder.failStart = false; recorder.emit = null; });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('Replay privacy lifecycle', () => {
+  it('discards every resource when rrweb returns no recorder and permits a clean explicit start', async () => {
+    vi.useFakeTimers();
+    recorder.failStart = true;
+    const fetchMock = vi.fn();
+    const beacon = vi.fn(() => true);
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('navigator', { sendBeacon: beacon });
+    const workerDestroy = vi.spyOn(CompressionWorker.prototype, 'destroy');
+    const transportDestroy = vi.spyOn(ReplayTransport.prototype, 'destroy');
+    const host = client();
+    const replay = replayIntegration({ sessionSampleRate: 1, flushInterval: 5 });
+    replay.install(host);
+    await Promise.resolve();
+    expect(recorder.starts).toBe(1);
+    expect(replay.getSessionId()).toBe('');
+    expect(host.listeners.size).toBe(0);
+    expect(host.captureException).toBe(host.original);
+    expect(workerDestroy).toHaveBeenCalledTimes(1);
+    expect(transportDestroy).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(100);
+    replay.flush();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(beacon).not.toHaveBeenCalled();
+
+    recorder.failStart = false;
+    replay.start();
+    await Promise.resolve();
+    expect(recorder.starts).toBe(2);
+    expect(replay.getSessionId()).toMatch(/^[0-9a-f]{32}$/);
+    expect(host.listeners.size).toBe(1);
+    replay.teardown?.();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('does not allocate resources on disabled install or denied start', async () => {
     const host = client(false);
     const timer = vi.spyOn(globalThis, 'setTimeout');
