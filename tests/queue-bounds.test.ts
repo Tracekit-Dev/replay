@@ -134,6 +134,82 @@ describe('bounded error history', () => {
 });
 
 describe('bounded delivery', () => {
+  it('freezes an old terminal chunk before user rotation while a periodic chunk is active', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let compression = 0;
+    const worker = { compress: vi.fn(async (events: unknown[]) => {
+      if (++compression === 1) await gate;
+      const bytes = new TextEncoder().encode(JSON.stringify(events));
+      return { compressed: gzipSync(bytes), originalSize: bytes.length };
+    }) };
+    const fetchMock = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal('fetch', fetchMock);
+    let identity = 'a'.repeat(32);
+    let segment = 0;
+    const transport = new ReplayTransport(resolveReplayConfig({ sessionSampleRate: 1 }, 'key', 'https://api.test'), worker as any);
+    transport.start(() => identity, () => segment++, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent(snapshot(1));
+    const periodic = transport.flush();
+    transport.addEvent(mutation(2));
+    const terminal = transport.flush(true);
+    identity = 'b'.repeat(32);
+    segment = 0;
+    transport.setSessionIdentity(identity);
+    transport.addEvent(snapshot(3));
+    expect(transport.getStatus().queueChunks).toBe(3);
+    release();
+    await periodic;
+    await terminal;
+    await transport.flush();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const requests = fetchMock.mock.calls.map(([url, options]) => ({
+      url: String(url), headers: (options as any).headers,
+      events: JSON.parse(new TextDecoder().decode(gunzipSync((options as any).body))),
+    }));
+    expect(requests.map((request) => request.url.includes('a'.repeat(32)))).toEqual([true, true, false]);
+    expect(requests.map((request) => request.headers['X-Replay-Final-Segment-Id'])).toEqual([undefined, '1', undefined]);
+    expect(requests.map((request) => request.headers['X-Segment-Id'])).toEqual(['0', '1', '0']);
+    expect(requests[1].events.some((event: any) => event.timestamp === 2)).toBe(true);
+    expect(requests[2].events.some((event: any) => event.timestamp === 2)).toBe(false);
+    transport.destroy();
+  });
+
+  it('records a bounded old-session loss when a terminal chunk cannot queue', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const worker = { compress: vi.fn(async (events: unknown[]) => {
+      await gate;
+      const bytes = new TextEncoder().encode(JSON.stringify(events));
+      return { compressed: gzipSync(bytes), originalSize: bytes.length };
+    }) };
+    const fetchMock = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal('fetch', fetchMock);
+    let identity = 'a'.repeat(32);
+    const transport = new ReplayTransport(resolveReplayConfig({ sessionSampleRate: 1, maxChunkCount: 2 }, 'key', 'https://api.test'), worker as any);
+    transport.start(() => identity, () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent(snapshot(1));
+    const periodic = transport.flush();
+    transport.addEvent(mutation(2));
+    void transport.flush(true);
+    identity = 'b'.repeat(32);
+    transport.setSessionIdentity(identity);
+    transport.addEvent(snapshot(3));
+    expect(transport.getStatus().droppedEvents).toBeGreaterThan(0);
+    release();
+    await periodic;
+    await transport.flush();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('a'.repeat(32)))).toBe(true);
+    for (const [url, options] of fetchMock.mock.calls) {
+      if (String(url).includes('b'.repeat(32))) {
+        const events = JSON.parse(new TextDecoder().decode(gunzipSync((options as any).body)));
+        expect(events.some((event: any) => event.timestamp === 2)).toBe(false);
+      }
+    }
+    transport.destroy();
+  });
   it('marks the known idle terminal segment final', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_800_000_000_000);
