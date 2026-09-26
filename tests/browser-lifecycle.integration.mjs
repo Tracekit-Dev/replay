@@ -104,6 +104,16 @@ try {
         return Boolean(id);
       });
       await storageContext.close();
+      const visibilityTransitions = await page.evaluate(() => {
+        let transitions = 0;
+        document.addEventListener('visibilitychange', () => { transitions += 1; });
+        Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+        document.dispatchEvent(new Event('visibilitychange'));
+        Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+        document.dispatchEvent(new Event('visibilitychange'));
+        return transitions;
+      });
+      assert.equal(visibilityTransitions, 2, `${name}: visibility transitions are observable`);
       for (const upload of uploads.slice(before)) {
         const serialized = JSON.stringify(upload.events);
         assert.doesNotMatch(serialized, /private-form-canary|url-query-canary|fragment-canary/);
@@ -113,7 +123,7 @@ try {
         assert.ok(boundaries[1].timestamp - boundaries[0].timestamp <= 1000);
       }
       outcomes.push({ engine: name, version: browser.version(), state: 'pass', uploads: uploads.length - before,
-        backgroundTab: actuallyHidden, pagehide, backForwardCache, blockedStorage });
+        backgroundTab: actuallyHidden, pagehide, backForwardCache, blockedStorage, visibilityTransitions });
       await page.close();
     } finally { await browser.close(); }
   }

@@ -108,6 +108,7 @@ The first automatic pageview uses the same ID when recording starts successfully
 Missing final or dropped-event evidence leaves recording health unknown or partial.
 The viewer marks unsupported legacy intervals and starts again at a real FullSnapshot.
 It does not display a known-wrong frame across a missing chunk.
+The viewer labels each unreconstructable interval as a gap.
 
 Replay uses owned breadcrumb subscriptions when the Browser SDK supports them.
 With older Browser bundles, Replay disables breadcrumb capture and reports a
