@@ -149,6 +149,27 @@ it('caps Retry-After by retry age', async () => {
   transport.destroy();
 });
 
+it('does not retry before a 429 Retry-After beyond the backoff ceiling', async () => {
+  vi.useFakeTimers();
+  const fetchMock = vi.fn(async () => ({ ok: false, status: 429,
+    headers: { get: () => '0.05' } }));
+  vi.stubGlobal('fetch', fetchMock);
+  const config = resolveReplayConfig({ sessionSampleRate: 1, maxRetryAttempts: 2,
+    maxRetryAgeMs: 100, retryBaseDelayMs: 1, maxBackoffMs: 10 }, 'key', 'https://api.test');
+  const transport = new ReplayTransport(config, { compress: vi.fn(async () => ({
+    compressed: new Uint8Array([1]), originalSize: 1,
+  })) } as any);
+  transport.start(() => 'a'.repeat(32), () => 0, () => 'session', () => '', () => '');
+  transport.stop();
+  transport.addEvent({ type: 5, timestamp: Date.now(), data: { tag: 'console-log', payload: { level: 'log' } } });
+  const flushing = transport.flush();
+  await vi.advanceTimersByTimeAsync(60);
+  await flushing;
+  expect(fetchMock).toHaveBeenCalledOnce();
+  expect(transport.getStatus().droppedChunks).toBe(1);
+  transport.destroy();
+});
+
 it.each(['write', 'read'])('posts one error after a worker %s failure', async (failure) => {
   const self = { postMessage: vi.fn(), onmessage: null as any };
   const FakeStream = class {
