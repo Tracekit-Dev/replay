@@ -36,6 +36,8 @@ export class ReplayTransport {
   private config: ResolvedReplayConfig;
   private compressionWorker: CompressionWorker;
   private bufferSize = 0;
+  private activeChunkBytes = 0;
+  private inflightPayloadBytes = 0;
   private recordingWindowStart: number | null = null;
   private recordingDeadlineFn: (() => number) | null = null;
   private allocateSegmentFn: (() => ReplaySegmentAllocation) | null = null;
@@ -78,7 +80,13 @@ export class ReplayTransport {
   }
 
   getStatus(): ReplayStatus {
-    return { ...this.status, pendingBytes: this.bufferSize, pendingEvents: this.pendingEvents.length, inflightFetches: this.activeRequests.size };
+    return {
+      ...this.status,
+      pendingBytes: this.bufferSize + this.activeChunkBytes + this.inflightPayloadBytes,
+      pendingEvents: this.pendingEvents.length,
+      pendingChunks: this.activeCompressions,
+      inflightFetches: this.activeRequests.size,
+    };
   }
 
   subscribeStatus(listener: ReplayStatusListener): () => void {
@@ -340,8 +348,14 @@ export class ReplayTransport {
     this.pendingIdentity = null;
 
     this.activeCompressions++;
+    const chunkBytes = events.reduce((total, event) => total + utf8Size(event), 0);
+    this.activeChunkBytes += chunkBytes;
+    this.publish('chunk_queued');
     try {
-      if (!this.isCurrent(generation)) return;
+      if (!this.isCurrent(generation)) {
+        this.outcome('unknown', 'cancelled');
+        return;
+      }
       const allocation = this.allocateSegmentFn?.() ?? {
         sessionId: this.sessionIdFn ? this.sessionIdFn() : '',
         segmentId: this.segmentIdFn ? this.segmentIdFn() : 0,
@@ -351,14 +365,19 @@ export class ReplayTransport {
       const { sessionId, segmentId } = allocation;
 
       if (!sessionId) {
+        this.outcome('dropped', 'missing_session');
         return; // No session -- discard events
       }
       if (pendingIdentity && (pendingIdentity.sessionId !== allocation.sessionId || pendingIdentity.userId !== allocation.userId)) {
+        this.outcome('dropped', 'identity_changed');
         return; // Do not attribute events across an identity boundary.
       }
 
       const safeEvents = sanitizeReplayEvents(events, { unmask: this.config.unmask, blockMedia: this.config.blockMedia });
-      if (safeEvents.length === 0) return;
+      if (safeEvents.length === 0) {
+        this.outcome('dropped', 'sanitized_empty');
+        return;
+      }
 
       if (safeEvents.length > this.config.maxChunkEvents) {
         this.outcome('dropped', 'chunk_event_limit');
@@ -369,7 +388,10 @@ export class ReplayTransport {
 
       // Compress via worker (or main-thread fallback)
       const { compressed, originalSize } = await this.compressionWorker.compress(safeEvents, segmentId);
-      if (!this.isCurrent(generation)) return;
+      if (!this.isCurrent(generation)) {
+        this.outcome('unknown', 'cancelled');
+        return;
+      }
 
       if (compressed.byteLength > this.config.maxChunkBytes) {
         this.outcome('dropped', 'chunk_byte_limit');
@@ -383,7 +405,9 @@ export class ReplayTransport {
     } catch {
       this.outcome('dropped', 'flush_error');
     } finally {
+      this.activeChunkBytes -= chunkBytes;
       this.activeCompressions--;
+      this.publish('chunk_finished');
     }
   }
 
@@ -468,7 +492,10 @@ export class ReplayTransport {
       // Cast through ArrayBuffer to satisfy TypeScript 5.x Uint8Array<ArrayBufferLike> vs BlobPart
       const blob = new Blob([compressed as unknown as BlobPart], { type: 'application/octet-stream' });
 
-      if (!this.isCurrent(generation)) return;
+      if (!this.isCurrent(generation)) {
+        this.outcome('unknown', 'cancelled');
+        return;
+      }
 
       // Try sendBeacon first (works during page unload)
       if (compressed.byteLength <= BEACON_SIZE_LIMIT && typeof navigator !== 'undefined' && navigator.sendBeacon) {
@@ -481,7 +508,10 @@ export class ReplayTransport {
 
       // Fallback: fetch with keepalive (also has ~64KB limit but is the standard approach)
       if (typeof fetch !== 'undefined') {
-        if (!this.isCurrent(generation)) return;
+        if (!this.isCurrent(generation)) {
+          this.outcome('unknown', 'cancelled');
+          return;
+        }
         fetch(url, {
           method: 'POST',
           headers: {
@@ -497,6 +527,7 @@ export class ReplayTransport {
       }
       this.outcome('dropped', 'beacon_unavailable');
     } catch {
+      this.outcome('dropped', 'flush_error');
       // Never crash the host app on tab close
     }
   }
@@ -521,10 +552,17 @@ export class ReplayTransport {
     const url = `${this.config.endpoint}/api/replays/${sessionId}/chunks`;
     const startedAt = Date.now();
     this.status.inflightPayloads++;
+    this.inflightPayloadBytes += compressed.byteLength;
+    this.publish('upload_started');
+    const finish = (result: { state: 'acknowledged' | 'dropped' | 'unknown'; reason: string }) => {
+      this.status.inflightPayloads--;
+      this.inflightPayloadBytes -= compressed.byteLength;
+      this.publish('upload_finished');
+      return result;
+    };
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       if (!this.isCurrent(generation)) {
-        this.status.inflightPayloads--;
-        return { state: 'unknown', reason: 'cancelled' };
+        return finish({ state: 'unknown', reason: 'cancelled' });
       }
       const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
       if (controller) this.activeRequests.add(controller);
@@ -539,19 +577,16 @@ export class ReplayTransport {
         if (controller) timeout = setTimeout(() => controller.abort(), this.config.fetchTimeoutMs);
         const response = await request;
         if (!this.isCurrent(generation)) {
-          this.status.inflightPayloads--;
-          return { state: 'unknown', reason: 'cancelled' };
+          return finish({ state: 'unknown', reason: 'cancelled' });
         }
 
         if (response.ok) {
-          this.status.inflightPayloads--;
-          return { state: 'acknowledged', reason: 'acknowledged' };
+          return finish({ state: 'acknowledged', reason: 'acknowledged' });
         }
 
         // Non-retryable status codes -- abort immediately
         if (response.status === 400 || response.status === 401 || response.status === 413) {
-          this.status.inflightPayloads--;
-          return { state: 'dropped', reason: `http_${response.status}` };
+          return finish({ state: 'dropped', reason: `http_${response.status}` });
         }
 
         if (response.status === 429) this.publish('rate_limited');
@@ -561,21 +596,18 @@ export class ReplayTransport {
           const retryAfter = response.status === 429 ? this.retryAfterMs(response) : RETRY_DELAYS[attempt];
           const remaining = this.config.retryMaxAgeMs - (Date.now() - startedAt);
           if (remaining <= 0 || !(await this.delay(Math.min(retryAfter, remaining), generation))) {
-            this.status.inflightPayloads--;
-            return { state: 'dropped', reason: response.status === 429 ? 'rate_limit_expired' : 'retry_expired' };
+            return finish({ state: 'dropped', reason: response.status === 429 ? 'rate_limit_expired' : 'retry_expired' });
           }
         }
       } catch {
         if (!this.isCurrent(generation)) {
-          this.status.inflightPayloads--;
-          return { state: 'unknown', reason: 'cancelled' };
+          return finish({ state: 'unknown', reason: 'cancelled' });
         }
         // Network error -- wait before retry
         if (attempt < MAX_ATTEMPTS - 1) {
           const remaining = this.config.retryMaxAgeMs - (Date.now() - startedAt);
           if (remaining <= 0 || !(await this.delay(Math.min(RETRY_DELAYS[attempt], remaining), generation))) {
-            this.status.inflightPayloads--;
-            return { state: 'dropped', reason: 'retry_expired' };
+            return finish({ state: 'dropped', reason: 'retry_expired' });
           }
         }
       } finally {
@@ -585,8 +617,7 @@ export class ReplayTransport {
     }
 
     // All attempts exhausted -- drop chunk (replay data loss is acceptable)
-    this.status.inflightPayloads--;
-    return { state: 'dropped', reason: 'retry_exhausted' };
+    return finish({ state: 'dropped', reason: 'retry_exhausted' });
   }
 
   private retryAfterMs(response: Response): number {
