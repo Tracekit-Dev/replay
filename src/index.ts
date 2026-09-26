@@ -6,6 +6,7 @@ import { startRecording } from './recorder';
 import { SessionManager } from './session';
 import { CompressionWorker } from './compression';
 import { ReplayTransport } from './transport';
+import { ReplayPrivacySanitizer } from './privacy';
 
 /** The host owns consent and reinitializes Browser after consent changes. */
 export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration {
@@ -70,6 +71,7 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
         ...resolveReplayConfig(config, browserConfig.apiKey, browserConfig.endpoint),
         serviceName: browserConfig.serviceName || '',
       };
+      const sanitizer = new ReplayPrivacySanitizer(replayConfig);
       // Allocate synchronously. Browser's initial pageview reads this ID after install().
       const ownedSession = new SessionManager(replayConfig);
       session = ownedSession;
@@ -91,7 +93,8 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
             stopRecorder = startRecording(replayConfig, (event, checkout) => {
               if (!current(token) || rotatingUser || session !== ownedSession) return;
               if (currentUserId() !== recordingUserId) { boundary(); return; }
-              ownedSession.onEvent(event, checkout);
+              const safe = sanitizer.sanitize(event);
+              if (safe) ownedSession.onEvent(safe, checkout);
             });
             if (!stopRecorder) {
               if (!recorderFailureReported) {
@@ -159,16 +162,18 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
               if (!current(token)) return;
               try {
                 if (crumb.type === 'http' || crumb.category?.startsWith('fetch') || crumb.category?.startsWith('xhr')) {
-                  record.addCustomEvent('network-request', {
+                  const safe = sanitizer.sanitize({ type: 5, timestamp: Date.now(), data: { tag: 'network-request', payload: {
                     method: crumb.data?.method || 'GET', url: crumb.data?.url || crumb.message || '',
                     status: crumb.data?.status_code, duration: crumb.data?.duration,
                     error: crumb.data?.error, traceparent: crumb.data?.traceparent,
-                  });
+                  } } });
+                  if (safe) record.addCustomEvent(safe.data.tag, safe.data.payload);
                 } else if (crumb.type === 'console' || crumb.category?.startsWith('console.')) {
                   const payload: Record<string, unknown> = { level: crumb.category?.replace('console.', '') || 'log', message: crumb.message || '' };
                   if (crumb.data && Object.keys(crumb.data).length > 0) payload.data = crumb.data;
                   if ((crumb.category === 'console.error' || crumb.category === 'console.warn') && crumb.data?.stack) payload.stack = crumb.data.stack;
-                  record.addCustomEvent('console-log', payload);
+                  const safe = sanitizer.sanitize({ type: 5, timestamp: Date.now(), data: { tag: 'console-log', payload } });
+                  if (safe) record.addCustomEvent(safe.data.tag, safe.data.payload);
                 }
               } catch { /* Never crash the host */ }
             });

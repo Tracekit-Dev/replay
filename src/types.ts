@@ -44,6 +44,9 @@ export interface ReplayConfig {
   /** Elements to block, in addition to data-tracekit-block and the media default. */
   block?: string[];
 
+  /** Elements whose text stays masked, even inside an unmask target. */
+  mask?: string[];
+
   /** Idle timeout in ms before session ends (default: 1800000 = 30 min) */
   idleTimeout?: number;
 
@@ -75,6 +78,7 @@ export interface ResolvedReplayConfig {
   errorSampleRate: number;
   unmask: string[];
   block: string[];
+  mask: string[];
   idleTimeout: number;
   flushInterval: number;
   maxBufferSize: number;

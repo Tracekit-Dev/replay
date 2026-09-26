@@ -35,11 +35,11 @@ export class CompressionWorker {
    * If worker creation fails (e.g. CSP), flag permanent main-thread fallback.
    */
   private initWorker(): void {
+    let url: string | null = null;
     try {
       const blob = new Blob([WORKER_SCRIPT], { type: 'application/javascript' });
-      const url = URL.createObjectURL(blob);
+      url = URL.createObjectURL(blob);
       this.worker = new Worker(url);
-      URL.revokeObjectURL(url); // URL can be revoked after worker creation
 
       this.worker.onmessage = (e: MessageEvent) => {
         const { compressed, segmentId, originalSize, error } = e.data;
@@ -80,6 +80,8 @@ export class CompressionWorker {
         '[TraceKit Replay] Cannot create Web Worker (CSP?). Using main-thread compression.',
       );
       this.useMainThread = true;
+    } finally {
+      if (url !== null) URL.revokeObjectURL(url);
     }
   }
 

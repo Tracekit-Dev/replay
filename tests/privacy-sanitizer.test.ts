@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { resolveReplayConfig } from '../src/config';
-import { sanitizeReplayEvent, sanitizeReplayUrl } from '../src/privacy';
+import { ReplayPrivacySanitizer, sanitizeReplayEvent, sanitizeReplayUrl } from '../src/privacy';
 import { startRecording } from '../src/recorder';
 
 const recordMock = vi.hoisted(() => vi.fn(() => () => {}));
@@ -19,7 +19,7 @@ describe('privacy sanitizer', () => {
 
   it('masks snapshot text and strips unsafe attributes, including protected descendants', () => {
     const input = { type: 2, timestamp: 2, data: { initialOffset: { top: 0, left: 0 }, node: {
-      type: 0, id: 1, childNodes: [{ type: 2, id: 2, tagName: 'div', attributes: { class: 'public', title: 'canary', href: 'https://u:canary@site.test/x?secret=canary#canary' }, childNodes: [
+      type: 0, id: 1, childNodes: [{ type: 2, id: 2, tagName: 'div', attributes: { class: 'ordinary', title: 'canary', href: 'https://u:canary@site.test/x?secret=canary#canary' }, childNodes: [
         { type: 3, id: 3, textContent: 'canary' },
         { type: 2, id: 4, tagName: 'input', attributes: { value: 'canary', type: 'password' }, childNodes: [] },
         { type: 2, id: 5, tagName: 'div', attributes: { 'data-tracekit-block': 'true', class: 'secret' }, childNodes: [{ type: 3, id: 6, textContent: 'canary' }] },
@@ -69,5 +69,45 @@ describe('privacy sanitizer', () => {
     const invalidOptions = recordMock.mock.lastCall?.[0];
     expect(invalidOptions.maskTextFn('canary', protectedElement)).toBe('******');
     expect(invalidOptions.blockSelector).not.toContain('[broken');
+  });
+
+  it('preserves explicit unmask only outside protected ancestors and descendants', () => {
+    const resolved = resolveReplayConfig({ unmask: ['.public'], mask: ['.masked'], block: ['.secret'] }, 'test-key', 'https://api.test');
+    const sanitizer = new ReplayPrivacySanitizer(resolved);
+    const snapshot = { type: 2, timestamp: 10, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+      { type: 2, id: 2, tagName: 'div', attributes: { class: 'public' }, childNodes: [
+        { type: 3, id: 3, textContent: 'public-copy' },
+        { type: 2, id: 4, tagName: 'div', attributes: { class: 'secret', 'data-tracekit-unmask': 'true' }, childNodes: [{ type: 3, id: 5, textContent: 'blocked-canary' }] },
+        { type: 2, id: 6, tagName: 'div', attributes: { class: 'masked', 'data-tracekit-unmask': 'true' }, childNodes: [{ type: 3, id: 7, textContent: 'masked-canary' }] },
+        { type: 2, id: 8, tagName: 'input', attributes: { type: 'password', value: 'password-canary' }, childNodes: [] },
+      ] },
+    ] } } };
+    const result = sanitizer.sanitize(snapshot);
+    expect(JSON.stringify(result)).toContain('public-copy');
+    expect(JSON.stringify(result)).not.toContain('blocked-canary');
+    expect(JSON.stringify(result)).not.toContain('masked-canary');
+    expect(JSON.stringify(result)).not.toContain('password-canary');
+
+    const mutation = { type: 3, timestamp: 11, data: { source: 0,
+      adds: [
+        { parentId: 4, nextId: null, node: { type: 3, id: 9, textContent: 'late-blocked-canary' } },
+        { parentId: 2, nextId: null, node: { type: 3, id: 10, textContent: 'late-public-copy' } },
+      ],
+      texts: [{ id: 3, value: 'changed-public-copy' }, { id: 5, value: 'late-blocked-canary' }, { id: 7, value: 'late-masked-canary' }],
+      attributes: [{ id: 4, attributes: { title: 'late-blocked-canary' } }], removes: [],
+    } };
+    const changed = sanitizer.sanitize(mutation);
+    expect(JSON.stringify(changed)).toContain('changed-public-copy');
+    expect(JSON.stringify(changed)).toContain('late-public-copy');
+    expect(JSON.stringify(changed)).not.toContain('late-blocked-canary');
+    expect(JSON.stringify(changed)).not.toContain('late-masked-canary');
+
+    sanitizer.sanitize({ type: 3, timestamp: 11.5, data: { source: 0, adds: [], texts: [], attributes: [{ id: 2, attributes: { class: 'secret' } }], removes: [] } });
+    const afterProtection = sanitizer.sanitize({ type: 3, timestamp: 11.6, data: { source: 0, adds: [], texts: [{ id: 3, value: 'new-protected-canary' }], attributes: [], removes: [] } });
+    expect(JSON.stringify(afterProtection)).not.toContain('new-protected-canary');
+
+    sanitizer.sanitize({ type: 3, timestamp: 12, data: { source: 0, adds: [], texts: [], attributes: [], removes: [{ parentId: 1, id: 2 }] } });
+    const afterRemoval = sanitizer.sanitize({ type: 3, timestamp: 13, data: { source: 0, adds: [], texts: [{ id: 3, value: 'after-remove-canary' }], attributes: [], removes: [] } });
+    expect(JSON.stringify(afterRemoval)).not.toContain('after-remove-canary');
   });
 });

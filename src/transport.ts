@@ -17,6 +17,7 @@
 import type { ResolvedReplayConfig } from './types';
 import { gzipSync } from 'fflate';
 import { CompressionWorker } from './compression';
+import { ReplayPrivacySanitizer, sanitizeReplayUrl } from './privacy';
 
 // Retry delays in milliseconds: 1s, 2s, 4s
 const RETRY_DELAYS = [1000, 2000, 4000];
@@ -46,6 +47,7 @@ export class ReplayTransport {
   private generation = 0;
   private destroyed = false;
   private abortController = new AbortController();
+  private sanitizer: ReplayPrivacySanitizer;
 
   // Interaction counters (accumulated across all chunks)
   private clickCount = 0;
@@ -61,6 +63,7 @@ export class ReplayTransport {
   constructor(config: ResolvedReplayConfig, compressionWorker: CompressionWorker) {
     this.config = config;
     this.compressionWorker = compressionWorker;
+    this.sanitizer = new ReplayPrivacySanitizer(config);
   }
 
   // ---------------------------------------------------------------------------
@@ -117,6 +120,7 @@ export class ReplayTransport {
     this.pendingEvents = [];
     this.bufferSize = 0;
     this.recordingWindowStart = null;
+    this.sanitizer.clear();
   }
 
   /** Start a visible recorder interval. Hidden time never belongs to a chunk. */
@@ -158,6 +162,9 @@ export class ReplayTransport {
   addEvent(event: any): void {
     if (this.destroyed) return;
     try {
+      const safe = this.sanitizer.sanitize(event);
+      if (!safe) return;
+      event = safe;
       // An error buffer begins at its oldest retained event, not recorder start.
       if (this.pendingEvents.length === 0 && this.replayTypeFn?.() === 'buffer' &&
           Number.isFinite(event.timestamp)) {
@@ -225,9 +232,10 @@ export class ReplayTransport {
     }
 
     // Swap buffer atomically
-    const events = this.pendingEvents;
+    const events = this.pendingEvents.map((event) => this.sanitizer.sanitize(event)).filter(Boolean);
     this.pendingEvents = [];
     this.bufferSize = 0;
+    if (events.length === 0) return;
 
     try {
       const sessionId = this.sessionIdFn ? this.sessionIdFn() : '';
@@ -271,9 +279,10 @@ export class ReplayTransport {
     }
 
     try {
-      const events = this.pendingEvents;
+      const events = this.pendingEvents.map((event) => this.sanitizer.sanitize(event)).filter(Boolean);
       this.pendingEvents = [];
       this.bufferSize = 0;
+      if (events.length === 0) return;
 
       const sessionId = this.sessionIdFn ? this.sessionIdFn() : '';
       const segmentId = this.segmentIdFn ? this.segmentIdFn() : 0;
@@ -291,8 +300,8 @@ export class ReplayTransport {
       const compressed = gzipSync(encoded, { level: 6 });
 
       // Build URL with query parameters (sendBeacon cannot set custom headers)
-      const replayUrl = this.urlFn ? this.urlFn() : '';
-      const replayUserId = this.userIdFn ? this.userIdFn() : '';
+      const replayUrl = sanitizeReplayUrl(this.urlFn?.() ?? '');
+      const replayUserId = '';
       const serviceName = boundedServiceName(this.config.serviceName);
       const url =
         `${this.config.endpoint}/api/replays/${sessionId}/chunks` +
@@ -396,9 +405,8 @@ export class ReplayTransport {
       'X-API-Key': this.config.apiKey,
       'X-Segment-Id': String(segmentId),
       'X-Replay-Type': this.replayTypeFn?.() ?? 'session',
-      'X-Replay-Url': this.urlFn?.() ?? '',
-      'X-Replay-User-Id': this.userIdFn?.() ?? '',
-      'X-Replay-User-Agent': typeof navigator !== 'undefined' ? navigator.userAgent : '',
+      'X-Replay-Url': sanitizeReplayUrl(this.urlFn?.() ?? ''),
+      'X-Replay-User-Id': '',
       'X-Click-Count': String(this.clickCount),
       'X-Keypress-Count': String(this.keypressCount),
     };

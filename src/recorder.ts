@@ -22,6 +22,7 @@ import type { ResolvedReplayConfig } from './types';
 function createMaskTextFn(
   unmaskSelectors: string[],
   blockSelectors: string[],
+  maskSelectors: string[],
 ): (text: string, element: HTMLElement | null) => string {
   // Build combined CSS selector for unmask targets
   const selectorParts = ['[data-tracekit-unmask]'];
@@ -30,6 +31,7 @@ function createMaskTextFn(
   }
   const combinedSelector = selectorParts.join(', ');
   const blockSelector = ['[data-tracekit-block]', ...blockSelectors].join(', ');
+  const maskSelector = ['[data-tracekit-mask]', ...maskSelectors].join(', ');
 
   return (text: string, element: HTMLElement | null): string => {
     // Privacy-first: mask when element is null (uncertain context)
@@ -40,6 +42,7 @@ function createMaskTextFn(
     // Check if element (or any ancestor) matches unmask selectors
     try {
       if (element.matches(blockSelector) || element.closest(blockSelector)) return '*'.repeat(text.length);
+      if (element.matches(maskSelector) || element.closest(maskSelector)) return '*'.repeat(text.length);
       if (element.matches(combinedSelector) || element.closest(combinedSelector)) {
         return text; // Unmask: return original text
       }
@@ -80,7 +83,7 @@ export function startRecording(
       maskAllInputs: true,
 
       // Custom mask function: same-length asterisk replacement with unmask support
-      maskTextFn: createMaskTextFn(config.unmask, config.block),
+      maskTextFn: createMaskTextFn(config.unmask, config.block, config.mask),
 
       // Block media elements (configurable, default: true for privacy)
       blockSelector: ['[data-tracekit-block]', ...config.block, ...(config.blockMedia ? ['img', 'video', 'canvas', 'svg', 'iframe'] : [])].join(', '),
