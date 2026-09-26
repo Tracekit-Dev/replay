@@ -529,7 +529,8 @@ export class ReplayPrivacySanitizer {
     const isFullSnapshot = !!event && typeof event === 'object' && (event as { type?: unknown }).type === 2;
     const isMutation = !!event && typeof event === 'object' && (event as any).type === 3 && (event as any).data?.source === 0;
     if (this.failed && !isFullSnapshot) return null;
-    if (isFullSnapshot) this.failed = false;
+    // A previously trusted object does not rebuild the cleared ancestry graph.
+    if (this.failed && isFullSnapshot && sanitizedEvents.has(event as object)) return null;
     const safe = sanitizeReplayEvent(event, this.config, this.states, this.tokens);
     if (!safe && (isFullSnapshot || isMutation)) {
       this.states.clear();
@@ -537,6 +538,8 @@ export class ReplayPrivacySanitizer {
       this.failed = true;
       return null;
     }
+    if (this.failed && isFullSnapshot && !safe?.data?.node) return null;
+    if (isFullSnapshot && safe?.data?.node) this.failed = false;
     if (this.states.size > MAX_NODES) {
       this.clear();
       this.failed = true;

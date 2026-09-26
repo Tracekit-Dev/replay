@@ -19,12 +19,14 @@ describe('privacy sanitizer', () => {
     const valid = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
       { type: 2, id: 2, tagName: 'div', attributes: {}, childNodes: [] },
     ] } } };
-    expect(sanitizer.sanitize(valid)).not.toBeNull();
+    const priorSnapshot = sanitizer.sanitize(valid);
+    expect(priorSnapshot).not.toBeNull();
     expect(sanitizer.sanitize({ type: 3, timestamp: 2, data: { source: 0, adds: [{ parentId: 2, node: {
       type: 2, id: 2, tagName: 'div', attributes: { class: 'public' }, childNodes: [],
     } }], texts: [], attributes: [], removes: [] } })).toBeNull();
     const marker = markerData === undefined ? { type: 2, timestamp: 3 } : { type: 2, timestamp: 3, data: markerData };
     expect(sanitizer.sanitize(marker)).toBeNull();
+    expect(sanitizer.sanitize(priorSnapshot)).toBeNull();
     expect(sanitizer.sanitize({ type: 3, timestamp: 4, data: { source: 1, id: 2, x: 10, y: 20 } })).toBeNull();
     expect(sanitizer.sanitize({ ...valid, timestamp: 5 })).not.toBeNull();
     expect(sanitizer.sanitize({ type: 3, timestamp: 6, data: { source: 1, id: 2, x: 10, y: 20 } })).not.toBeNull();
