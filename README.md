@@ -65,12 +65,31 @@ These are displayed in the replay list as country flags, browser/device/OS icons
 ```javascript
 const replay = replayIntegration();
 
+// Stop recording and discard local pending data.
+replay.stop();
+
+// Start a new recording identity when Browser SDK enabled is true.
+replay.start();
+
 // Force upload pending events (e.g., before navigation)
 replay.flush();
 
 // Get the current session ID (for linking to errors)
 replay.getSessionId();
 ```
+
+Replay uses the Browser SDK `enabled` option as its privacy control. A disabled
+host creates no recorder, worker, storage entry, timer, or Replay subscription.
+Withdraw consent through the existing host reinitialization flow:
+
+```javascript
+init({ ...config, enabled: false });
+```
+
+Direct mutation of resolved configuration is unsupported. `stop()` blocks
+automatic resume from visibility, input, and error callbacks. `start()` creates
+a fresh session identity. Bytes already sent to the server cannot be withdrawn
+by a client stop call.
 
 ## Documentation
 

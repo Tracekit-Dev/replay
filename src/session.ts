@@ -28,6 +28,7 @@ type StoredSession = SessionState & {
   ownerToken: string;
   documentToken: string;
   active: boolean;
+  revoked?: boolean;
 };
 const DOCUMENT_TOKEN = randomHex(32);
 
@@ -81,7 +82,7 @@ function getOrCreateSession(config: ResolvedReplayConfig, ownerToken: string): {
         const segmentId = stored.segmentId;
         const mode = stored.mode;
         const age = Date.now() - Number(stored.lastActivity);
-        if ((stored.ownerToken === ownerToken || (stored.documentToken === DOCUMENT_TOKEN && stored.active === false)) && SESSION_ID_PATTERN.test(stored.sessionId) &&
+        if ((stored.ownerToken === ownerToken || (stored.documentToken === DOCUMENT_TOKEN && stored.active === false && stored.revoked !== true)) && SESSION_ID_PATTERN.test(stored.sessionId) &&
             Number.isSafeInteger(segmentId) && segmentId >= 0 && segmentId <= MAX_SEGMENT_ID &&
             (mode === 'session' || mode === 'buffer' || mode === 'off') &&
             Number.isFinite(age) && age >= 0 && age < config.idleTimeout) {
@@ -98,7 +99,7 @@ function getOrCreateSession(config: ResolvedReplayConfig, ownerToken: string): {
 /**
  * Persist session state to sessionStorage.
  */
-function persistSession(state: SessionState, config: ResolvedReplayConfig, ownerToken: string, active = true): void {
+function persistSession(state: SessionState, config: ResolvedReplayConfig, ownerToken: string, active = true, revoked = false): void {
   try {
     if (typeof sessionStorage !== 'undefined') {
       const serialized = JSON.stringify({
@@ -109,6 +110,7 @@ function persistSession(state: SessionState, config: ResolvedReplayConfig, owner
         ownerToken,
         documentToken: DOCUMENT_TOKEN,
         active,
+        revoked,
       });
       sessionStorage.setItem(storageKeyForConfig(config), serialized);
       // Older direct consumers may still inspect this key. Replay never reads it.
@@ -157,6 +159,8 @@ export class SessionManager {
   private rotating = false;
   private activityHandlers: Array<[string, (event: Event) => void]> = [];
   private active = true;
+  private manuallyStopped = false;
+  private privacyRevoked = false;
 
   // Idle timeout handle
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -200,7 +204,7 @@ export class SessionManager {
    */
   onEvent(event: any, _isCheckout: boolean): void {
     this.ensureIdentitySafety();
-    if (!this.active || !this.isVisible()) return;
+    if (this.manuallyStopped || !this.active || !this.isVisible()) return;
     if (Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
       this.handleIdleTimeout();
       return;
@@ -230,6 +234,7 @@ export class SessionManager {
    */
   onError(): void {
     this.ensureIdentitySafety();
+    if (this.manuallyStopped) return;
     if (this.active && Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
       this.handleIdleTimeout();
       return;
@@ -306,10 +311,10 @@ export class SessionManager {
   /** Current session ID */
   getSessionId(): string {
     this.ensureIdentitySafety();
-    if (this.active && Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
+    if (!this.manuallyStopped && this.active && Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
       this.handleIdleTimeout();
     }
-    return this.active && this.state.mode !== 'off' ? this.state.sessionId : '';
+    return !this.manuallyStopped && this.active && this.state.mode !== 'off' ? this.state.sessionId : '';
   }
 
   /** Return the retained identity needed while flushing an inactive session. */
@@ -420,6 +425,7 @@ export class SessionManager {
 
   private renewFromVisibleActivity(): boolean {
     this.ensureIdentitySafety();
+    if (this.manuallyStopped) return false;
     if (!this.isVisible()) return false;
     const now = Date.now();
     if (this.active && now - this.state.lastActivity >= this.config.idleTimeout) {
@@ -448,7 +454,8 @@ export class SessionManager {
   }
 
   private ensureIdentitySafety(): void {
-    if (this.rotating) return;
+    if (this.rotating || this.manuallyStopped) return;
+    if (!this.active) return;
     const userIdentity = this.readUserIdentity();
     if (userIdentity !== this.identityUserId) {
       this.rotatingUserId = this.identityUserId;
@@ -549,6 +556,20 @@ export class SessionManager {
     document.addEventListener('visibilitychange', this.visibilityHandler);
   }
 
+  private removeLifecycleListeners(): void {
+    if (this.visibilityHandler && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.visibilityHandler);
+      this.visibilityHandler = null;
+    }
+
+    if (typeof document !== 'undefined') {
+      for (const [name, handler] of this.activityHandlers) {
+        document.removeEventListener(name, handler, { capture: true });
+      }
+    }
+    this.activityHandlers = [];
+  }
+
   private setupActivityListeners(): void {
     if (typeof document === 'undefined') return;
     const names = ['pointerdown', 'pointerup', 'keydown', 'touchstart', 'touchend', 'wheel', 'click', 'input', 'change', 'submit'];
@@ -566,28 +587,56 @@ export class SessionManager {
   // Cleanup
   // -------------------------------------------------------------------------
 
+  /** Stop recording and remove lifecycle observers without destroying the manager. */
+  stop(): void {
+    this.manuallyStopped = true;
+    this.privacyRevoked = true;
+    this.active = false;
+    if (this.idleTimer !== null) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+    this.removeLifecycleListeners();
+    this.ringBuffer.clear();
+    persistSession(this.state, this.config, this.ownerToken, false, true);
+  }
+
+  /** Start a stopped manager with a fresh identity and lifecycle observers. */
+  start(): void {
+    if (!this.manuallyStopped) return;
+    this.manuallyStopped = false;
+    this.privacyRevoked = false;
+    const now = Date.now();
+    this.state = {
+      sessionId: newSessionId(this.config),
+      mode: decideSamplingMode(this.config),
+      startedAt: now,
+      lastActivity: now,
+      segmentId: 0,
+    };
+    this.active = this.isVisible();
+    this.ringBuffer.clear();
+    persistSession(this.state, this.config, this.ownerToken, this.active, false);
+    this.setupVisibilityListener();
+    this.setupActivityListeners();
+    if (this.active) this.resetIdleTimer();
+  }
+
   /**
    * Tear down the session manager: clear timers, remove listeners, clear buffer.
    */
   destroy(): void {
+    this.manuallyStopped = true;
     this.active = false;
     if (this.idleTimer !== null) {
       clearTimeout(this.idleTimer);
       this.idleTimer = null;
     }
 
-    if (this.visibilityHandler && typeof document !== 'undefined') {
-      document.removeEventListener('visibilitychange', this.visibilityHandler);
-      this.visibilityHandler = null;
-    }
-
-    if (typeof document !== 'undefined') {
-      for (const [name, handler] of this.activityHandlers) document.removeEventListener(name, handler, { capture: true });
-    }
-    this.activityHandlers = [];
+    this.removeLifecycleListeners();
 
     this.ringBuffer.clear();
-    persistSession(this.state, this.config, this.ownerToken, false);
+    persistSession(this.state, this.config, this.ownerToken, false, this.privacyRevoked);
 
     this.eventCallback = null;
     this.flushCallback = null;

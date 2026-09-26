@@ -12,6 +12,7 @@
 
 import { record } from 'rrweb';
 import type { ResolvedReplayConfig } from './types';
+import { sanitizeReplayEvent } from './privacy';
 
 /**
  * Create a maskTextFn that masks all text EXCEPT elements matching
@@ -32,6 +33,16 @@ function createMaskTextFn(
   return (text: string, element: HTMLElement | null): string => {
     // Privacy-first: mask when element is null (uncertain context)
     if (!element) {
+      return '*'.repeat(text.length);
+    }
+
+    // Explicit protection always wins over a broad ancestor unmask rule.
+    try {
+      const protectedSelector = 'input, textarea, select, [data-tracekit-mask], [data-tracekit-block], .rr-block, .tracekit-block';
+      if (element.matches(protectedSelector) || element.closest(protectedSelector)) {
+        return '*'.repeat(text.length);
+      }
+    } catch {
       return '*'.repeat(text.length);
     }
 
@@ -63,7 +74,8 @@ export function startRecording(
   try {
     const stopFn = record({
       emit: (event, isCheckout) => {
-        onEvent(event, isCheckout ?? false);
+        const safeEvent = sanitizeReplayEvent(event, { unmask: config.unmask, blockMedia: config.blockMedia });
+        if (safeEvent) onEvent(safeEvent, isCheckout ?? false);
       },
 
       // ================================================================
@@ -80,7 +92,7 @@ export function startRecording(
       maskTextFn: createMaskTextFn(config.unmask),
 
       // Block media elements (configurable, default: true for privacy)
-      ...(config.blockMedia ? { blockSelector: 'img, video, canvas, svg, iframe' } : {}),
+      ...(config.blockMedia ? { blockSelector: 'img, video, canvas, svg, iframe, object, embed' } : {}),
 
       // Do NOT record canvas content
       recordCanvas: false,

@@ -18,6 +18,7 @@ interface PendingCompression {
   resolve: (data: { compressed: Uint8Array; originalSize: number }) => void;
   reject: (err: Error) => void;
   events: any[];
+  generation: number;
 }
 
 export class CompressionWorker {
@@ -25,6 +26,7 @@ export class CompressionWorker {
   private pendingCallbacks = new Map<number, PendingCompression>();
   private useMainThread = false;
   private nextRequestId = 0;
+  private generation = 0;
 
   constructor() {
     this.initWorker();
@@ -46,6 +48,10 @@ export class CompressionWorker {
         const pending = this.pendingCallbacks.get(segmentId);
         if (!pending) return;
         this.pendingCallbacks.delete(segmentId);
+        if (pending.generation !== this.generation) {
+          pending.reject(new Error('Replay compression result is stale'));
+          return;
+        }
 
         if (error) {
           // Worker reported an error (e.g. CompressionStream not available)
@@ -55,7 +61,10 @@ export class CompressionWorker {
             error,
           );
           this.useMainThread = true;
-          this.compressMainThread(pending.events).then(pending.resolve).catch(pending.reject);
+          this.compressMainThread(pending.events).then((data) => {
+            if (pending.generation === this.generation) pending.resolve(data);
+            else pending.reject(new Error('Replay compression result is stale'));
+          }).catch(pending.reject);
           return;
         }
 
@@ -70,7 +79,14 @@ export class CompressionWorker {
         this.worker?.terminate();
         this.worker = null;
         for (const pending of this.pendingCallbacks.values()) {
-          this.compressMainThread(pending.events).then(pending.resolve).catch(pending.reject);
+          if (pending.generation !== this.generation) {
+            pending.reject(new Error('Replay compression result is stale'));
+            continue;
+          }
+          this.compressMainThread(pending.events).then((data) => {
+            if (pending.generation === this.generation) pending.resolve(data);
+            else pending.reject(new Error('Replay compression result is stale'));
+          }).catch(pending.reject);
         }
         this.pendingCallbacks.clear();
       };
@@ -95,12 +111,15 @@ export class CompressionWorker {
     events: any[],
     _segmentId: number,
   ): Promise<{ compressed: Uint8Array; originalSize: number }> {
+    const generation = this.generation;
     if (this.useMainThread || !this.worker) {
-      return this.compressMainThread(events);
+      const data = await this.compressMainThread(events);
+      if (generation !== this.generation) throw new Error('Replay compression result is stale');
+      return data;
     }
 
     return new Promise((resolve, reject) => {
-      const entry: PendingCompression = { resolve, reject, events };
+      const entry: PendingCompression = { resolve, reject, events, generation };
       // Session segment numbers restart at zero; worker requests never reuse them.
       const requestId = this.nextRequestId++;
       this.pendingCallbacks.set(requestId, entry);
@@ -108,7 +127,10 @@ export class CompressionWorker {
         this.worker!.postMessage({ events, segmentId: requestId });
       } catch {
         this.pendingCallbacks.delete(requestId);
-        this.compressMainThread(events).then(resolve).catch(reject);
+        this.compressMainThread(events).then((data) => {
+          if (generation === this.generation) resolve(data);
+          else reject(new Error('Replay compression result is stale'));
+        }).catch(reject);
       }
     });
   }
@@ -129,14 +151,19 @@ export class CompressionWorker {
   /**
    * Terminate the worker and clean up pending callbacks.
    */
+  cancel(): void {
+    this.generation += 1;
+    for (const pending of this.pendingCallbacks.values()) {
+      pending.reject(new Error('Replay compression cancelled'));
+    }
+    this.pendingCallbacks.clear();
+  }
+
   destroy(): void {
+    this.cancel();
     if (this.worker) {
       this.worker.terminate();
       this.worker = null;
     }
-    for (const pending of this.pendingCallbacks.values()) {
-      pending.reject(new Error('Replay compression worker destroyed'));
-    }
-    this.pendingCallbacks.clear();
   }
 }

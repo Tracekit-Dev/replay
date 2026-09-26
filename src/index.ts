@@ -15,7 +15,7 @@
  *   recorder -> session manager -> compression worker -> transport
  *
  * Recording starts immediately when the integration is installed via init().
- * Manual control: flush() forces an upload, getSessionId() returns the current ID.
+ * Manual control: start(), stop(), and flush() control the recording lifecycle.
  */
 
 import type { ReplayConfig, ResolvedReplayConfig, Integration } from './types';
@@ -25,23 +25,32 @@ import { startRecording } from './recorder';
 import { SessionManager } from './session';
 import { CompressionWorker } from './compression';
 import { ReplayTransport } from './transport';
+import { sanitizeCustomEventPayload } from './privacy';
 
 /**
  * Create a session replay integration for @tracekit/browser.
  *
  * @param config - Optional replay configuration overrides
- * @returns Integration object with flush() and getSessionId() manual control methods
+ * @returns Integration object with lifecycle, flush(), and getSessionId() methods
  */
 export function replayIntegration(
   config: ReplayConfig = {},
-): Integration & { flush(): void; getSessionId(): string } {
+): Integration & { start(): void; stop(): void; flush(): void; getSessionId(): string } {
   let session: SessionManager | null = null;
   let compressionWorker: CompressionWorker | null = null;
   let transport: ReplayTransport | null = null;
   let stopRecording: (() => void) | null = null;
   let resolvedConfig: ResolvedReplayConfig | null = null;
+  let clientRef: any = null;
+  let breadcrumbUnsubscribe: (() => void) | null = null;
+  let restoreCaptureException: (() => void) | null = null;
+  let manuallyStopped = false;
+  let startRecordingPipeline: () => void = () => {};
+  let stopRecordingPipeline: () => void = () => {};
+  let installBreadcrumbBridge: () => void = () => {};
+  const hostRecordingEnabled = (): boolean => clientRef?.getConfig?.().enabled !== false;
 
-  const integration: Integration & { flush(): void; getSessionId(): string } = {
+  const integration: Integration & { start(): void; stop(): void; flush(): void; getSessionId(): string } = {
     name: 'replay',
 
     /**
@@ -56,6 +65,14 @@ export function replayIntegration(
         // Resolve config with the client's credentials and service boundary.
         // The service name is a discriminator, not a new authorization boundary.
         const clientConfig = client.getConfig();
+        clientRef = client;
+        // The host enabled flag is the existing consent mechanism. Do not
+        // create session storage, workers, timers, or subscriptions when it is off.
+        if (clientConfig.enabled === false) {
+          manuallyStopped = true;
+          return;
+        }
+        manuallyStopped = false;
         const scope = client.getScope();
         let identityUserId = '';
         try { identityUserId = String(scope?.getUser?.()?.id ?? ''); } catch { identityUserId = ''; }
@@ -73,14 +90,8 @@ export function replayIntegration(
           try { return String(client.getScope()?.getUser?.()?.id ?? ''); } catch { return ''; }
         });
 
-        // Create compression worker (Web Worker with main-thread fallback)
-        compressionWorker = new CompressionWorker();
-
-        // Create transport (30-second flush interval, retry, sendBeacon fallback)
-        transport = new ReplayTransport(resolvedConfig, compressionWorker);
-
-        const start = () => {
-          if (!session || !resolvedConfig || !session.isActive() || !session.isVisible() || session.getMode() === 'off') return;
+        startRecordingPipeline = () => {
+          if (!hostRecordingEnabled() || manuallyStopped || !session || !resolvedConfig || !transport || !session.isActive() || !session.isVisible() || session.getMode() === 'off') return;
           if (stopRecording) return;
           transport!.startRecordingWindow();
           stopRecording = startRecording(resolvedConfig, (event, isCheckout) => {
@@ -88,7 +99,7 @@ export function replayIntegration(
           });
           if (!stopRecording) transport!.stopRecordingWindow();
         };
-        const stop = () => {
+        stopRecordingPipeline = () => {
           if (stopRecording) {
             stopRecording();
             stopRecording = null;
@@ -96,10 +107,10 @@ export function replayIntegration(
           transport?.stopRecordingWindow();
         };
 
-        // Wire session -> transport: events flow from session to transport
+        // Wire session -> transport: events flow from session to transport.
         session.setEventCallback((events: any[]) => {
           for (const event of events) {
-            transport!.addEvent(event);
+            transport?.addEvent(event);
           }
         });
 
@@ -108,30 +119,50 @@ export function replayIntegration(
         // so the playback UI can link errors to their replay session.
         // Uses setTag (not setExtra) so replay_id appears as a direct span attribute
         // in OTLP output -- extras would prefix it as "extra.replay_id".
-        const originalCaptureException = client.captureException.bind(client);
-        client.captureException = function (error: Error, context?: any): string {
-          const replayId = session?.getSessionId() ?? '';
-          const scope = client.getScope();
-          if (replayId) {
-            scope.setTag('replay_id', replayId);
-          }
-          const result = originalCaptureException(error, context);
-          if (replayId) {
-            scope.setTag('replay_id', '');
-          }
-          if (session) {
-            session.onError();
-          }
-          return result;
-        };
+        const originalCaptureException = client.captureException;
+        if (typeof originalCaptureException === 'function') {
+          const wrappedCaptureException = function (this: unknown, error: Error, context?: any): string {
+            const replayId = session?.getSessionId() ?? '';
+            const captureScope = client.getScope();
+            const previousReplayTag = replayId ? (() => {
+              try {
+                const tags = captureScope?.getTags?.() ?? {};
+                return {
+                  present: Object.prototype.hasOwnProperty.call(tags, 'replay_id'),
+                  value: typeof tags.replay_id === 'string' ? tags.replay_id : '',
+                };
+              } catch {
+                return { present: false, value: '' };
+              }
+            })() : { present: false, value: '' };
+            try {
+              if (replayId) captureScope.setTag('replay_id', replayId);
+              return originalCaptureException.call(this, error, context);
+            } finally {
+              if (replayId) {
+                try {
+                  captureScope.setTag('replay_id', previousReplayTag.present ? previousReplayTag.value : '');
+                } catch { /* Host scope may be tearing down. */ }
+              }
+              session?.onError();
+            }
+          };
+          client.captureException = wrappedCaptureException;
+          restoreCaptureException = () => {
+            // Preserve a wrapper installed by another addon after Replay.
+            if (client.captureException === wrappedCaptureException) {
+              client.captureException = originalCaptureException;
+            }
+          };
+        }
 
         // Bridge breadcrumbs to rrweb custom events for playback sidebar tabs.
         // Network requests become 'network-request' events, console output becomes
         // 'console-log' events -- both timestamped in the rrweb event stream.
-        scope.onBreadcrumb((crumb: any) => {
+        const breadcrumbBridge = (crumb: any) => {
           try {
             if (crumb.type === 'http' || crumb.category?.startsWith('fetch') || crumb.category?.startsWith('xhr')) {
-              record.addCustomEvent('network-request', {
+              const payload = sanitizeCustomEventPayload({
                 method: crumb.data?.method || 'GET',
                 url: crumb.data?.url || crumb.message || '',
                 status: crumb.data?.status_code,
@@ -139,6 +170,7 @@ export function replayIntegration(
                 error: crumb.data?.error,
                 traceparent: crumb.data?.traceparent,
               });
+              if (payload) record.addCustomEvent('network-request', payload);
             } else if (crumb.type === 'console' || crumb.category?.startsWith('console.')) {
               // Console tab requires expandable objects and stack traces for errors
               const payload: Record<string, unknown> = {
@@ -153,12 +185,27 @@ export function replayIntegration(
               if ((crumb.category === 'console.error' || crumb.category === 'console.warn') && crumb.data?.stack) {
                 payload.stack = crumb.data.stack;
               }
-              record.addCustomEvent('console-log', payload);
+              const safePayload = sanitizeCustomEventPayload(payload);
+              if (safePayload) record.addCustomEvent('console-log', safePayload);
             }
           } catch {
             // Never crash the host app
           }
-        });
+        };
+        installBreadcrumbBridge = () => {
+          if (breadcrumbUnsubscribe || typeof scope?.subscribeBreadcrumb !== 'function') {
+            if (!breadcrumbUnsubscribe && typeof scope?.subscribeBreadcrumb !== 'function') {
+              console.warn('[TraceKit Replay] Breadcrumb capture disabled: owned Browser subscriptions are unavailable.');
+            }
+            return;
+          }
+          try {
+            breadcrumbUnsubscribe = scope.subscribeBreadcrumb(breadcrumbBridge);
+          } catch {
+            breadcrumbUnsubscribe = null;
+          }
+        };
+        installBreadcrumbBridge();
 
         // Wire idle timeout: flush pending events when session goes idle
         session.setFlushCallback(() => {
@@ -169,50 +216,97 @@ export function replayIntegration(
 
         // Wire idle timeout restart: stop recording, start fresh with new snapshot
         session.setRestartCallback(() => {
-          stop();
-          start();
+          stopRecordingPipeline();
+          startRecordingPipeline();
         });
 
         session.setIdleStopCallback(() => {
-          stop();
+          stopRecordingPipeline();
         });
 
         // Wire visibility pause: stop recording and flush sync on tab hide
         session.setPauseCallback(() => {
           if (stopRecording) {
-            stop();
+            stopRecordingPipeline();
           }
           transport?.flushSync();
         });
 
         // Wire visibility resume: restart recording on tab show
         session.setResumeCallback(() => {
-          start();
+          startRecordingPipeline();
         });
 
-        // Start transport (30-second flush interval)
-        transport.start(
-          () => session!.getFlushSessionId(),
-          () => session!.nextSegmentId(),
-          () => session!.getMode(),
-          // URL: current page location
-          () => typeof window !== 'undefined' ? window.location.href : '',
-          // User ID: from browser SDK scope
-          () => {
-            try {
-              const scope = client.getScope();
-              return scope.getUser()?.id || '';
-            } catch { return ''; }
-          },
-          () => session!.getState().lastActivity + resolvedConfig!.idleTimeout,
-          () => session!.allocateSegment(),
-          () => session!.getIdentity(),
-        );
+        const startTransport = () => {
+          if (!session || !resolvedConfig || !compressionWorker) return;
+          transport = new ReplayTransport(resolvedConfig, compressionWorker);
+          transport.start(
+            () => session!.getFlushSessionId(),
+            () => session!.nextSegmentId(),
+            () => session!.getMode(),
+            () => typeof window !== 'undefined' ? window.location.href : '',
+            () => {
+              try {
+                return client.getScope().getUser()?.id || '';
+              } catch { return ''; }
+            },
+            () => session!.getState().lastActivity + resolvedConfig!.idleTimeout,
+            () => session!.allocateSegment(),
+            () => session!.getIdentity(),
+          );
+        };
+
+        // Create compression worker and transport only after all gates pass.
+        compressionWorker = new CompressionWorker();
+        startTransport();
 
         // Start recording immediately (LOCKED: recording starts on init())
-        start();
+        startRecordingPipeline();
       } catch (err) {
         console.warn('[TraceKit Replay] Failed to initialize replay recording:', err);
+        integration.teardown?.();
+      }
+    },
+
+    /** Stop recording, discard pending data, and block automatic resume. */
+    stop(): void {
+      if (manuallyStopped) return;
+      manuallyStopped = true;
+      try {
+        session?.stop();
+        if (breadcrumbUnsubscribe) {
+          breadcrumbUnsubscribe();
+          breadcrumbUnsubscribe = null;
+        }
+        stopRecordingPipeline();
+        transport?.destroy();
+        compressionWorker?.destroy();
+        transport = null;
+        compressionWorker = null;
+      } catch {
+        // Replay stop must never crash the host app.
+      }
+    },
+
+    /** Start recording with a fresh identity after an explicit stop. */
+    start(): void {
+      try {
+        if (!manuallyStopped || !session || !resolvedConfig || !hostRecordingEnabled()) return;
+        manuallyStopped = false;
+        session.start();
+        compressionWorker = new CompressionWorker();
+        installBreadcrumbBridge();
+        transport = new ReplayTransport(resolvedConfig, compressionWorker);
+        transport.start(
+          () => session!.getFlushSessionId(), () => session!.nextSegmentId(), () => session!.getMode(),
+          () => typeof window !== 'undefined' ? window.location.href : '',
+          () => { try { return clientRef.getScope().getUser()?.id || ''; } catch { return ''; } },
+          () => session!.getState().lastActivity + resolvedConfig!.idleTimeout,
+          () => session!.allocateSegment(), () => session!.getIdentity(),
+        );
+        startRecordingPipeline();
+      } catch {
+        manuallyStopped = true;
       }
     },
 
@@ -222,15 +316,15 @@ export function replayIntegration(
      */
     teardown(): void {
       try {
-        if (stopRecording) {
-          stopRecording();
-          stopRecording = null;
-          transport?.stopRecordingWindow();
-        } else {
-          transport?.stopRecordingWindow();
-        }
+        manuallyStopped = true;
+        session?.stop();
+        if (breadcrumbUnsubscribe) breadcrumbUnsubscribe();
+        breadcrumbUnsubscribe = null;
+        stopRecordingPipeline();
         transport?.destroy();
         compressionWorker?.destroy();
+        restoreCaptureException?.();
+        restoreCaptureException = null;
         session?.destroy();
         session = null;
         compressionWorker = null;

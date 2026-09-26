@@ -21,6 +21,17 @@ const DEFAULTS = {
 
 const MIN_IDLE_TIMEOUT_MS = 1_000;
 const MAX_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const MAX_UNMASK_SELECTORS = 50;
+const MAX_UNMASK_SELECTOR_LENGTH = 256;
+
+function resolveUnmask(value: string[] | undefined): string[] {
+  if (!Array.isArray(value)) return DEFAULTS.unmask;
+  return value
+    .filter((selector): selector is string => typeof selector === 'string')
+    .map((selector) => selector.trim().slice(0, MAX_UNMASK_SELECTOR_LENGTH))
+    .filter(Boolean)
+    .slice(0, MAX_UNMASK_SELECTORS);
+}
 
 function resolveIdleTimeout(value: number | undefined): number {
   if (value === undefined) return DEFAULTS.idleTimeout;
@@ -90,7 +101,7 @@ export function resolveReplayConfig(
   return {
     sessionSampleRate,
     errorSampleRate,
-    unmask: config.unmask ?? DEFAULTS.unmask,
+    unmask: resolveUnmask(config.unmask),
     idleTimeout: resolveIdleTimeout(config.idleTimeout),
     flushInterval: config.flushInterval ?? DEFAULTS.flushInterval,
     maxBufferSize: config.maxBufferSize ?? DEFAULTS.maxBufferSize,
