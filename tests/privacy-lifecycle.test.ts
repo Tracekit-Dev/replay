@@ -42,6 +42,49 @@ beforeEach(() => { recorder.starts = 0; recorder.stops = 0; recorder.failStart =
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('Replay privacy lifecycle', () => {
+  it('releases an identity failure before allocating resources and retries after crypto returns', async () => {
+    vi.useFakeTimers();
+    const originalCrypto = globalThis.crypto;
+    vi.stubGlobal('crypto', undefined);
+    const fetchMock = vi.fn();
+    const beacon = vi.fn(() => true);
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('navigator', { sendBeacon: beacon });
+    const blobUrl = vi.spyOn(URL, 'createObjectURL');
+    const interval = vi.spyOn(globalThis, 'setInterval');
+    const OriginalAbortController = globalThis.AbortController;
+    let controllers = 0;
+    vi.stubGlobal('AbortController', class extends OriginalAbortController {
+      constructor() { super(); controllers++; }
+    });
+    const host = client();
+    const replay = replayIntegration({ sessionSampleRate: 1, flushInterval: 5 });
+    replay.install(host);
+    expect(replay.getSessionId()).toBe('');
+    expect(recorder.starts).toBe(0);
+    expect(blobUrl).not.toHaveBeenCalled();
+    expect(controllers).toBe(0);
+    expect(interval).not.toHaveBeenCalled();
+    expect(host.listeners.size).toBe(0);
+    expect(host.captureException).toBe(host.original);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(100);
+    replay.flush();
+    expect(replay.getSessionId()).toBe('');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(beacon).not.toHaveBeenCalled();
+
+    vi.stubGlobal('crypto', originalCrypto);
+    replay.start();
+    expect(replay.getSessionId()).toMatch(/^[0-9a-f]{32}$/);
+    expect(recorder.starts).toBe(1);
+    expect(host.listeners.size).toBe(1);
+    replay.teardown?.();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(host.listeners.size).toBe(0);
+    expect(host.captureException).toBe(host.original);
+  });
+
   it('discards every resource when rrweb returns no recorder and permits a clean explicit start', async () => {
     vi.useFakeTimers();
     recorder.failStart = true;
