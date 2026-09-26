@@ -27,6 +27,7 @@ const URL_FIELD_NAMES = new Set([
   'requesturl', 'documenturl', 'sourceurl', 'targeturl', 'redirecturl',
 ]);
 const MEDIA_TAG_NAMES = new Set(['img', 'video', 'canvas', 'svg', 'iframe', 'object', 'embed']);
+const DYNAMIC_SENSITIVE_KEY = /(?:password|passwd|secret|token|authorization|cookie|credential|api[-_ ]?key|access[-_ ]?key|private[-_ ]?key|client[-_ ]?secret)/i;
 
 export interface PrivacyOptions {
   unmask?: string[];
@@ -179,6 +180,13 @@ function safeObjectKey(key: string): string {
   return bounded(key).slice(0, MAX_STRING_LENGTH);
 }
 
+function sanitizeObjectKey(key: string): string | null {
+  if (key === 'toJSON' || /[\u0000-\u001f\u007f]/.test(key)) return null;
+  if (DYNAMIC_SENSITIVE_KEY.test(key) || MARKER_STRING.test(key)) return null;
+  if (/^[a-z][a-z\d+.-]*:\/\//i.test(key) || /[?#]/.test(key)) return null;
+  return safeObjectKey(key);
+}
+
 function sanitizeAttributes(
   attributes: unknown,
   protectedNode: boolean,
@@ -188,11 +196,13 @@ function sanitizeAttributes(
   if (!attributes || typeof attributes !== 'object' || Array.isArray(attributes)) return {};
   const output: Record<string, unknown> = {};
   for (const key of Object.keys(attributes as Record<string, unknown>).slice(0, MAX_KEYS)) {
-    if (key === 'toJSON') continue;
+    const outputKey = sanitizeObjectKey(key);
+    if (outputKey === null) continue;
     const value = (attributes as Record<string, unknown>)[key];
-    const outputKey = safeObjectKey(key);
     if (typeof value === 'string') {
       output[outputKey] = protectedNode ? mask(value) : sanitizeString(value, key, 'attribute');
+    } else if (value === null) {
+      output[outputKey] = null;
     } else {
       const safeValue = sanitizeValue(value, key, depth + 1, opts, 'generic');
       if (safeValue !== null) output[outputKey] = safeValue;
@@ -213,6 +223,22 @@ function copyNodeScalar(output: Record<string, unknown>, source: Record<string, 
   else if (typeof value === 'string') output[key] = sanitizeString(value, key, 'attribute');
 }
 
+function copyNodeStructural(output: Record<string, unknown>, source: Record<string, unknown>, type: number): void {
+  const rootId = safeNumber(source.rootId);
+  if (rootId !== null) output.rootId = rootId;
+  for (const key of ['isShadowHost', 'isShadow', 'isCustom', 'isStyle']) {
+    if (typeof source[key] === 'boolean') output[key] = source[key];
+  }
+  if (type === 0 && typeof source.compatMode === 'string') {
+    output.compatMode = sanitizeString(source.compatMode, 'compatMode', 'attribute');
+  }
+  if (type === 1) {
+    for (const key of ['name', 'publicId', 'systemId']) {
+      if (typeof source[key] === 'string') output[key] = sanitizeString(source[key], key, 'attribute');
+    }
+  }
+}
+
 function sanitizeNode(node: unknown, context: NodeContext, depth: number, opts: ResolvedPrivacyOptions): unknown {
   if (!node || typeof node !== 'object' || Array.isArray(node)) return null;
   if (depth > opts.maxDepth) return null;
@@ -222,6 +248,7 @@ function sanitizeNode(node: unknown, context: NodeContext, depth: number, opts: 
   const output: Record<string, unknown> = { type };
   const id = safeNumber(source.id);
   if (id !== null) output.id = id;
+  copyNodeStructural(output, source, type);
 
   if (type === 3 || type === 4 || type === 5) {
     const key = type === 3 || type === 4 ? 'textContent' : 'text';
@@ -274,11 +301,12 @@ function sanitizeValue(
   }
   const output: Record<string, unknown> = {};
   for (const childKey of Object.keys(value as Record<string, unknown>).slice(0, MAX_KEYS)) {
-    if (childKey === 'toJSON') continue;
+    const outputKey = sanitizeObjectKey(childKey);
+    if (outputKey === null) continue;
     const childValue = (value as Record<string, unknown>)[childKey];
     if (typeof childValue === 'function') continue;
     const safeValue = sanitizeValue(childValue, childKey, depth + 1, opts, mode);
-    if (safeValue !== null) output[safeObjectKey(childKey)] = safeValue;
+    if (safeValue !== null) output[outputKey] = safeValue;
   }
   return output;
 }
@@ -329,6 +357,7 @@ function sanitizeMutation(data: Record<string, unknown>, opts: ResolvedPrivacyOp
       const id = safeNumber(source.id);
       if (parentId !== null) item.parentId = parentId;
       if (id !== null) item.id = id;
+      if (typeof source.isShadow === 'boolean') item.isShadow = source.isShadow;
       removes.push(item);
     }
     output.removes = removes;
@@ -343,13 +372,17 @@ function sanitizeMutation(data: Record<string, unknown>, opts: ResolvedPrivacyOp
       const item: Record<string, unknown> = { node };
       const parentId = safeNumber(source.parentId);
       const nextId = safeNumber(source.nextId);
+      const previousId = safeNumber(source.previousId);
       if (parentId !== null) item.parentId = parentId;
+      if (previousId !== null) item.previousId = previousId;
+      else if (source.previousId === null) item.previousId = null;
       if (nextId !== null) item.nextId = nextId;
       else if (source.nextId === null) item.nextId = null;
       adds.push(item);
     }
     output.adds = adds;
   }
+  if (data.isAttachIframe === true) output.isAttachIframe = true;
   return output;
 }
 
@@ -367,8 +400,11 @@ function sanitizeEventData(type: number, data: Record<string, unknown>, opts: Re
   if (type === 3 && data.source === 0) return sanitizeMutation(data, opts);
   if (type === 3 && data.source === 5) {
     const output: Record<string, unknown> = { source: 5 };
+    const id = safeNumber(data.id);
+    if (id !== null) output.id = id;
     if (typeof data.text === 'string') output.text = mask(data.text);
     if (typeof data.isChecked === 'boolean') output.isChecked = data.isChecked;
+    if (typeof data.userTriggered === 'boolean') output.userTriggered = data.userTriggered;
     return output;
   }
   if (type === 4) {

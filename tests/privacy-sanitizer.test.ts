@@ -253,4 +253,132 @@ describe('Replay privacy sanitizer', () => {
     expect(JSON.stringify(custom)).not.toContain(CANARY);
     expect(JSON.stringify(custom)).not.toContain('toJSON');
   });
+
+  it('drops unsafe dynamic keys in console, custom events, and attributes', () => {
+    const unsafeUrlKey = 'https://user:pass@example.test/path?query=plain#fragment';
+    const consolePayload = sanitizeConsolePayload({
+      [CANARY]: 'value',
+      'password-field': 'value',
+      [unsafeUrlKey]: 'value',
+      'line\nfeed': 'value',
+      safe: 'visible',
+    });
+    const custom = sanitizeReplayEvent({
+      type: 5,
+      timestamp: 1,
+      data: {
+        tag: 'custom',
+        payload: {
+          [CANARY]: 'value',
+          authorizationHeader: 'value',
+          [unsafeUrlKey]: 'value',
+          safe: 'visible',
+        },
+      },
+    });
+    const attributes = sanitizeReplayEvent({
+      type: 2,
+      timestamp: 1,
+      data: {
+        node: {
+          type: 2,
+          id: 1,
+          tagName: 'div',
+          attributes: {
+            [CANARY]: 'value',
+            'data-secret': 'value',
+            [unsafeUrlKey]: 'value',
+            class: 'safe',
+          },
+          childNodes: [],
+        },
+      },
+    });
+
+    expect(JSON.stringify(consolePayload)).not.toContain(CANARY);
+    expect(JSON.stringify(consolePayload)).not.toContain('password-field');
+    expect(JSON.stringify(consolePayload)).not.toContain('user:pass');
+    expect(JSON.stringify(consolePayload)).toContain('safe');
+    expect(JSON.stringify(custom)).not.toContain(CANARY);
+    expect(JSON.stringify(custom)).not.toContain('authorizationHeader');
+    expect(JSON.stringify(attributes)).not.toContain(CANARY);
+    expect(JSON.stringify(attributes)).not.toContain('data-secret');
+    expect((attributes as any).data.node.attributes.class).toBe('safe');
+  });
+
+  it('preserves rrweb input, mutation, iframe, document, shadow, and node structure', () => {
+    const input = sanitizeReplayEvent({
+      type: 3,
+      timestamp: 1,
+      data: { source: 5, id: 10, text: CANARY, isChecked: true, userTriggered: true },
+    });
+    const mutation = sanitizeReplayEvent({
+      type: 3,
+      timestamp: 2,
+      data: {
+        source: 0,
+        isAttachIframe: true,
+        texts: [{ id: 11, value: CANARY }],
+        attributes: [{ id: 12, attributes: { removed: null, title: CANARY } }],
+        removes: [{ parentId: 1, id: 12, isShadow: true }],
+        adds: [{
+          parentId: 1,
+          previousId: 13,
+          nextId: null,
+          node: {
+            type: 0,
+            id: 14,
+            compatMode: 'CSS1Compat',
+            rootId: 15,
+            isShadowHost: true,
+            isShadow: true,
+            childNodes: [{
+              type: 2,
+              id: 16,
+              tagName: 'custom-element',
+              isCustom: true,
+              childNodes: [],
+              attributes: {},
+            }, {
+              type: 1,
+              id: 17,
+              name: 'html',
+              publicId: '',
+              systemId: '',
+            }],
+          },
+        }],
+      },
+    });
+    const variants = [
+      { type: 0, data: {} },
+      { type: 1, data: {} },
+      { type: 4, data: { href: 'https://example.test/' , width: 100, height: 200 } },
+      { type: 5, data: { tag: 'custom', payload: { safe: true } } },
+      { type: 6, data: { plugin: 'plugin', payload: { safe: true } } },
+      { type: 3, data: { source: 1, positions: [{ x: 1, y: 2, id: 3, timeOffset: 4 }] } },
+      { type: 3, data: { source: 2, type: 2, id: 3, x: 1, y: 2, pointerType: 0 } },
+      { type: 3, data: { source: 3, id: 3, x: 1, y: 2 } },
+      { type: 3, data: { source: 4, width: 100, height: 200 } },
+      { type: 3, data: { source: 6, id: 3, type: 0, currentTime: 1 } },
+      { type: 3, data: { source: 7, id: 3, type: 0, currentTime: 1 } },
+      { type: 3, data: { source: 8, id: 3, index: [0], adds: [], removes: [] } },
+      { type: 3, data: { source: 9, id: 3, type: 0, commands: [] } },
+      { type: 3, data: { source: 10, family: 'sans', fontSource: '', buffer: false } },
+      { type: 3, data: { source: 14, ranges: [] } },
+      { type: 3, data: { source: 15, id: 3, styleIds: [] } },
+      { type: 3, data: { source: 16, define: { name: 'custom-element' } } },
+    ];
+
+    expect((input as any).data).toMatchObject({ source: 5, id: 10, isChecked: true, userTriggered: true });
+    expect((mutation as any).data.isAttachIframe).toBe(true);
+    expect((mutation as any).data.attributes[0].attributes.removed).toBeNull();
+    expect((mutation as any).data.adds[0].previousId).toBe(13);
+    expect((mutation as any).data.adds[0].nextId).toBeNull();
+    const documentNode = (mutation as any).data.adds[0].node;
+    expect(documentNode).toMatchObject({ compatMode: 'CSS1Compat', rootId: 15, isShadowHost: true, isShadow: true });
+    expect(documentNode.childNodes[0]).toMatchObject({ isCustom: true });
+    expect(documentNode.childNodes[1]).toMatchObject({ name: 'html', publicId: '', systemId: '' });
+    for (const variant of variants) expect(sanitizeReplayEvent(variant)).not.toBeNull();
+  });
 });

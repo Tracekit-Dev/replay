@@ -57,7 +57,12 @@ function adversarialEvents() {
           type: 2,
           id: 10,
           tagName: 'main',
-          attributes: {},
+          attributes: {
+            [CANARY]: 'key-value',
+            'data-secret': 'key-value',
+            'https://user:pass@example.test/path?query=key#fragment': 'key-value',
+            class: 'safe',
+          },
           childNodes: [{ type: 3, id: 11, textContent: CANARY, toJSON: () => ({ leaked: CANARY }) }],
         },
       },
@@ -90,6 +95,9 @@ function adversarialEvents() {
           stack: 'Error at https://user:pass@example.test/app.js?query=five#fragment:1:2',
           toJSON: () => ({ leaked: CANARY }),
           canary: CANARY,
+          [`${CANARY}-key`]: 'value',
+          authorizationHeader: 'value',
+          'line\nfeed': 'value',
         },
       },
     },
@@ -202,6 +210,9 @@ describe('Replay privacy upload boundary', () => {
     expect(fetchBody).not.toContain('user:pass');
     expect(fetchBody).not.toContain('?query=');
     expect(fetchBody).not.toContain('#fragment');
+    expect(fetchBody).not.toContain('data-secret');
+    expect(fetchBody).not.toContain('authorizationHeader');
+    expect(fetchBody).not.toContain('line\\nfeed');
     fetchTransport.destroy();
 
     const beacons: Array<[string, Blob]> = [];
@@ -223,6 +234,9 @@ describe('Replay privacy upload boundary', () => {
     expect(beaconBody).not.toContain('user:pass');
     expect(beaconBody).not.toContain('?query=');
     expect(beaconBody).not.toContain('#fragment');
+    expect(beaconBody).not.toContain('data-secret');
+    expect(beaconBody).not.toContain('authorizationHeader');
+    expect(beaconBody).not.toContain('line\\nfeed');
     beaconTransport.destroy();
   });
 });
