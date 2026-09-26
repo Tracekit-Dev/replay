@@ -10,6 +10,31 @@ vi.mock('rrweb', () => ({ record: recordMock }));
 const config = () => resolveReplayConfig({ unmask: ['.public'], block: ['.secret'] }, 'test-key', 'https://api.test');
 
 describe('privacy sanitizer', () => {
+  it.each([
+    ['missing data', undefined],
+    ['empty data', {}],
+    ['malformed data', { node: { type: 2, id: 9, tagName: 'div>', attributes: {}, childNodes: [] } }],
+  ])('keeps failed ancestry closed after a type 2 marker with %s', (_name, markerData) => {
+    const sanitizer = new ReplayPrivacySanitizer(config());
+    const valid = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+      { type: 2, id: 2, tagName: 'div', attributes: {}, childNodes: [] },
+    ] } } };
+    expect(sanitizer.sanitize(valid)).not.toBeNull();
+    expect(sanitizer.sanitize({ type: 3, timestamp: 2, data: { source: 0, adds: [{ parentId: 2, node: {
+      type: 2, id: 2, tagName: 'div', attributes: { class: 'public' }, childNodes: [],
+    } }], texts: [], attributes: [], removes: [] } })).toBeNull();
+    const marker = markerData === undefined ? { type: 2, timestamp: 3 } : { type: 2, timestamp: 3, data: markerData };
+    expect(sanitizer.sanitize(marker)).toBeNull();
+    expect(sanitizer.sanitize({ type: 3, timestamp: 4, data: { source: 1, id: 2, x: 10, y: 20 } })).toBeNull();
+    expect(sanitizer.sanitize({ ...valid, timestamp: 5 })).not.toBeNull();
+    expect(sanitizer.sanitize({ type: 3, timestamp: 6, data: { source: 1, id: 2, x: 10, y: 20 } })).not.toBeNull();
+  });
+
+  it('keeps payload-free legacy type 2 markers before any privacy failure', () => {
+    const sanitizer = new ReplayPrivacySanitizer(config());
+    expect(sanitizer.sanitize({ type: 2, timestamp: 1 })).toEqual({ type: 2, timestamp: 1, data: {} });
+    expect(sanitizer.sanitize({ type: 2, timestamp: 2, data: {} })).toEqual({ type: 2, timestamp: 2, data: {} });
+  });
   it.each([['inconsistent', 4], ['missing', 99]])('rejects a remove with an %s parent and stays failed until FullSnapshot', (_name, forgedParentId) => {
     const sanitizer = new ReplayPrivacySanitizer(resolveReplayConfig({ unmask: ['.public'] }, 'test-key', 'https://api.test'));
     const snapshot = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
