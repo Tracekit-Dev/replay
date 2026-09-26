@@ -20,6 +20,7 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
   let generation = 0;
   let manuallyStopped = false;
   let missingBreadcrumbReported = false;
+  let recorderFailureReported = false;
 
   const enabled = () => {
     try { return client?.getConfig()?.enabled !== false; }
@@ -72,9 +73,7 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
       // Allocate synchronously. Browser's initial pageview reads this ID after install().
       const ownedSession = new SessionManager(replayConfig);
       session = ownedSession;
-      void ownedSession.ready().then(() => {
-        if (!current(token) || session !== ownedSession) return;
-        try {
+      try {
           worker = new CompressionWorker();
           transport = new ReplayTransport(replayConfig, worker);
           let recordingUserId = currentUserId();
@@ -89,7 +88,13 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
               if (currentUserId() !== recordingUserId) { boundary(); return; }
               ownedSession.onEvent(event, checkout);
             });
-            if (!stopRecorder) transport?.stopRecordingWindow();
+            if (!stopRecorder) {
+              if (!recorderFailureReported) {
+                recorderFailureReported = true;
+                console.warn('[TraceKit Replay] Recorder startup failed; replay capture is disabled.');
+              }
+              discard();
+            }
           };
 
           const boundary = () => {
@@ -179,12 +184,7 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
           if (token !== generation || session !== ownedSession) return;
           console.warn('[TraceKit Replay] Failed to initialize replay recording:', error);
           discard();
-        }
-      }).catch((error) => {
-        if (token !== generation || session !== ownedSession) return;
-        console.warn('[TraceKit Replay] Failed to establish replay identity:', error);
-        discard();
-      });
+      }
     } catch (error) {
       console.warn('[TraceKit Replay] Failed to initialize replay recording:', error);
       discard();
