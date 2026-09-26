@@ -312,6 +312,9 @@ export function replayIntegration(
           () => session!.getState().lastActivity + resolvedConfig!.idleTimeout,
           () => session!.allocateSegment(), () => session!.getIdentity(),
         );
+        for (const [listener, unsubscribe] of statusSubscriptions) {
+          if (!unsubscribe) statusSubscriptions.set(listener, transport.subscribeStatus(listener));
+        }
         startRecordingPipeline();
       } catch {
         manuallyStopped = true;
@@ -373,6 +376,8 @@ export function replayIntegration(
     getStatus(): ReplayStatus {
       return transport?.getStatus() ?? {
         state: manuallyStopped ? 'stopped' : 'idle',
+        captureState: manuallyStopped ? 'stopped' : 'idle',
+        deliveryState: manuallyStopped ? 'stopped' : 'idle',
         pendingBytes: 0,
         pendingEvents: 0,
         pendingChunks: 0,
@@ -401,4 +406,4 @@ export function replayIntegration(
 }
 
 // Re-export types for consumers
-export type { ReplayConfig, Integration, ReplayStatus, ReplayStatusListener } from './types';
+export type { ReplayConfig, Integration, ReplayStatus, ReplayStatusListener, ReplayCaptureState, ReplayDeliveryState } from './types';

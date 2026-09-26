@@ -47,10 +47,15 @@ export class ReplayTransport {
   private activeRequests = new Set<AbortController>();
   private retryWaiters = new Map<ReturnType<typeof setTimeout>, (active: boolean) => void>();
   private cancelled = false;
+  private awaitingSnapshot = false;
+  private allowBufferedHistory = false;
   private activeCompressions = 0;
   private listeners = new Set<ReplayStatusListener>();
+  private publishQueued = false;
   private status: ReplayStatus = {
     state: 'idle',
+    captureState: 'idle',
+    deliveryState: 'idle',
     pendingBytes: 0,
     pendingEvents: 0,
     pendingChunks: 0,
@@ -96,11 +101,20 @@ export class ReplayTransport {
   }
 
   private publish(reason?: string): void {
-    if (reason) this.status.lastReason = reason;
-    const snapshot = this.getStatus();
-    for (const listener of this.listeners) {
-      try { listener(snapshot); } catch { /* Observers cannot break capture. */ }
+    if (reason && !reason.startsWith('chunk_') && !reason.startsWith('upload_') && !reason.startsWith('capture_')) {
+      this.status.lastReason = reason;
     }
+    if (this.publishQueued) return;
+    this.publishQueued = true;
+    const notify = () => {
+      this.publishQueued = false;
+      const snapshot = this.getStatus();
+      for (const listener of this.listeners) {
+        try { listener(snapshot); } catch { /* Observers cannot break capture. */ }
+      }
+    };
+    if (typeof queueMicrotask === 'function') queueMicrotask(notify);
+    else Promise.resolve().then(notify);
   }
 
   private outcome(outcome: 'acknowledged' | 'dropped' | 'unknown', reason: string): void {
@@ -141,6 +155,8 @@ export class ReplayTransport {
     this.identityFn = getIdentity ?? null;
     this.cancelled = false;
     this.status.state = 'recording';
+    this.status.captureState = 'recording';
+    this.status.deliveryState = 'idle';
     this.publish('started');
 
     // Start periodic flush at config.flushInterval (default 30s)
@@ -185,18 +201,26 @@ export class ReplayTransport {
       resolve(false);
     }
     this.status.state = 'stopped';
+    this.status.captureState = 'stopped';
+    this.status.deliveryState = 'stopped';
     this.publish('cancelled');
   }
 
   /** Start a visible recorder interval. Hidden time never belongs to a chunk. */
   startRecordingWindow(): void {
     this.recordingWindowStart = Date.now();
+    this.status.captureState = 'recording';
+    this.publish('capture_recording');
   }
 
   /** Close the interval before stopping, hiding, or changing session identity. */
   stopRecordingWindow(): void {
     this.appendRecordingBoundaries();
     this.recordingWindowStart = null;
+    if (!this.cancelled) {
+      this.status.captureState = 'suspended';
+      this.publish('capture_suspended');
+    }
   }
 
   private appendRecordingBoundaries(): void {
@@ -263,6 +287,10 @@ export class ReplayTransport {
   }
 
   private enqueuePendingEvent(event: any, prepend = false, evictAge = true): void {
+    if (this.awaitingSnapshot && event?.type !== 2 && !this.allowBufferedHistory) {
+      this.status.droppedEvents++;
+      return;
+    }
     const bytes = utf8Size(event);
     if (bytes <= 0) return;
     if (bytes > this.config.maxBufferSize) {
@@ -271,8 +299,14 @@ export class ReplayTransport {
       if (event?.type === 2) {
         this.pendingEvents = [];
         this.bufferSize = 0;
+        this.awaitingSnapshot = true;
+        this.allowBufferedHistory = this.replayTypeFn?.() === 'buffer';
       }
       return;
+    }
+    if (event?.type === 2) {
+      this.awaitingSnapshot = false;
+      this.allowBufferedHistory = false;
     }
     if (prepend) this.pendingEvents.unshift(event);
     else this.pendingEvents.push(event);
@@ -303,7 +337,17 @@ export class ReplayTransport {
       const dropped = this.pendingEvents.shift();
       this.bufferSize -= utf8Size(dropped);
       this.status.droppedEvents++;
+      if (dropped?.type === 2) {
+        this.awaitingSnapshot = true;
+        this.allowBufferedHistory = this.replayTypeFn?.() === 'buffer';
+      }
       this.publish('queue_limit');
+    }
+    if (this.awaitingSnapshot && !this.allowBufferedHistory && this.pendingEvents.length > 0) {
+      this.status.droppedEvents += this.pendingEvents.length;
+      this.pendingEvents = [];
+      this.bufferSize = 0;
+      this.publish('snapshot_required');
     }
   }
 
@@ -344,6 +388,8 @@ export class ReplayTransport {
     const events = this.pendingEvents;
     this.pendingEvents = [];
     this.bufferSize = 0;
+    const flushedBufferedHistory = this.allowBufferedHistory;
+    if (flushedBufferedHistory) this.allowBufferedHistory = false;
     const pendingIdentity = this.pendingIdentity;
     this.pendingIdentity = null;
 
@@ -351,6 +397,7 @@ export class ReplayTransport {
     const chunkBytes = events.reduce((total, event) => total + utf8Size(event), 0);
     this.activeChunkBytes += chunkBytes;
     this.publish('chunk_queued');
+    if (flushedBufferedHistory) this.awaitingSnapshot = true;
     try {
       if (!this.isCurrent(generation)) {
         this.outcome('unknown', 'cancelled');
@@ -407,6 +454,7 @@ export class ReplayTransport {
     } finally {
       this.activeChunkBytes -= chunkBytes;
       this.activeCompressions--;
+      if (this.activeCompressions === 0 && !this.cancelled) this.status.deliveryState = 'idle';
       this.publish('chunk_finished');
     }
   }
@@ -539,7 +587,7 @@ export class ReplayTransport {
   /**
    * Upload compressed chunk via fetch with exponential backoff retry.
    * Retries up to 3 times with delays of 1s, 2s, 4s.
-   * Non-retryable status codes (400, 401, 413) abort immediately.
+   * Non-retryable status codes (400, 401, 409, 413) abort immediately.
    * On final failure: drop chunk silently.
    */
   private async uploadWithRetry(
@@ -552,11 +600,13 @@ export class ReplayTransport {
     const url = `${this.config.endpoint}/api/replays/${sessionId}/chunks`;
     const startedAt = Date.now();
     this.status.inflightPayloads++;
+    this.status.deliveryState = 'uploading';
     this.inflightPayloadBytes += compressed.byteLength;
     this.publish('upload_started');
     const finish = (result: { state: 'acknowledged' | 'dropped' | 'unknown'; reason: string }) => {
       this.status.inflightPayloads--;
       this.inflightPayloadBytes -= compressed.byteLength;
+      this.status.deliveryState = this.activeCompressions > 0 ? 'uploading' : 'idle';
       this.publish('upload_finished');
       return result;
     };
@@ -575,7 +625,14 @@ export class ReplayTransport {
           ...(controller ? { signal: controller.signal } : {}),
         });
         if (controller) timeout = setTimeout(() => controller.abort(), this.config.fetchTimeoutMs);
-        const response = await request;
+        const response = controller
+          ? await request
+          : await Promise.race([
+            request,
+            new Promise<Response>((_resolve, reject) => {
+              timeout = setTimeout(() => reject(new Error('Replay fetch timed out')), this.config.fetchTimeoutMs);
+            }),
+          ]);
         if (!this.isCurrent(generation)) {
           return finish({ state: 'unknown', reason: 'cancelled' });
         }
@@ -585,7 +642,7 @@ export class ReplayTransport {
         }
 
         // Non-retryable status codes -- abort immediately
-        if (response.status === 400 || response.status === 401 || response.status === 413) {
+        if (response.status === 400 || response.status === 401 || response.status === 409 || response.status === 413) {
           return finish({ state: 'dropped', reason: `http_${response.status}` });
         }
 

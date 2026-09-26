@@ -24,11 +24,27 @@ interface BufferedEvent {
   bytes: number;
 }
 
-const DEFAULT_LIMITS: RingBufferLimits = {
+let DEFAULT_LIMITS: RingBufferLimits = {
   maxAgeMs: 60_000,
   maxBytes: 24_117_248,
   maxEvents: 10_000,
 };
+
+/** Configure the numeric constructor used by the session manager. */
+export function configureRingBufferDefaults(limits: Partial<RingBufferLimits> & {
+  maxBufferSize?: number;
+  maxBufferEvents?: number;
+}): void {
+  const maxAgeMs = Number(limits.maxAgeMs);
+  const maxBytes = Number(limits.maxBytes ?? (limits as Partial<RingBufferLimits> & { maxBufferSize?: number }).maxBufferSize);
+  const maxEvents = Number(limits.maxEvents ?? (limits as Partial<RingBufferLimits> & { maxBufferEvents?: number }).maxBufferEvents);
+  DEFAULT_LIMITS = {
+    ...DEFAULT_LIMITS,
+    ...(Number.isFinite(maxAgeMs) && maxAgeMs > 0 ? { maxAgeMs } : {}),
+    ...(Number.isFinite(maxBytes) && maxBytes > 0 ? { maxBytes } : {}),
+    ...(Number.isFinite(maxEvents) && maxEvents > 0 ? { maxEvents: Math.floor(maxEvents) } : {}),
+  } as RingBufferLimits;
+}
 
 function utf8Size(value: unknown): number {
   try {

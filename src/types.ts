@@ -148,11 +148,14 @@ export interface ReplayChunk {
   originalSize: number;
 }
 
-export type ReplayDeliveryState = 'idle' | 'recording' | 'stopped';
+export type ReplayDeliveryState = 'idle' | 'recording' | 'uploading' | 'stopped';
+export type ReplayCaptureState = 'idle' | 'recording' | 'suspended' | 'stopped';
 
 /** Safe delivery facts for diagnostics. This type never contains replay data. */
 export interface ReplayStatus {
   state: ReplayDeliveryState;
+  captureState: ReplayCaptureState;
+  deliveryState: ReplayDeliveryState;
   pendingBytes: number;
   pendingEvents: number;
   pendingChunks: number;
