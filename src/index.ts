@@ -175,10 +175,12 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
           );
           beginRecorder();
         } catch (error) {
+          if (token !== generation || session !== ownedSession) return;
           console.warn('[TraceKit Replay] Failed to initialize replay recording:', error);
           discard();
         }
       }).catch((error) => {
+        if (token !== generation || session !== ownedSession) return;
         console.warn('[TraceKit Replay] Failed to establish replay identity:', error);
         discard();
       });
