@@ -55,6 +55,8 @@ describe('Replay privacy lifecycle', () => {
     const host = client();
     const replay = replayIntegration({ sessionSampleRate: 1, flushInterval: 5 });
     replay.install(host);
+    // Browser reads this value synchronously for the first automatic pageview.
+    expect(replay.getSessionId()).toBe('');
     await Promise.resolve();
     expect(recorder.starts).toBe(1);
     expect(replay.getSessionId()).toBe('');
