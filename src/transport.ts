@@ -296,6 +296,7 @@ export class ReplayTransport {
       // Build URL with query parameters (sendBeacon cannot set custom headers)
       const replayUrl = this.urlFn ? this.urlFn() : '';
       const replayUserId = allocation.userId;
+      const serviceName = this.boundedServiceName();
       const url =
         `${this.config.endpoint}/api/replays/${sessionId}/chunks` +
         `?api_key=${encodeURIComponent(this.config.apiKey)}` +
@@ -304,6 +305,7 @@ export class ReplayTransport {
         `&replay_type=${replayType}` +
         `&replay_url=${encodeURIComponent(replayUrl)}` +
         `&replay_user_id=${encodeURIComponent(replayUserId)}` +
+        (serviceName ? `&replay_service_name=${encodeURIComponent(serviceName)}` : '') +
         `&click_count=${this.clickCount}` +
         `&keypress_count=${this.keypressCount}`;
 
@@ -387,6 +389,7 @@ export class ReplayTransport {
 
   /** Capture metadata before compression or retries can cross a session boundary. */
   private uploadHeaders(segmentId: number, userId: string, replayType: string): Record<string, string> {
+    const serviceName = this.boundedServiceName();
     return {
       'Content-Type': 'application/octet-stream',
       'X-API-Key': this.config.apiKey,
@@ -397,7 +400,17 @@ export class ReplayTransport {
       'X-Replay-User-Agent': typeof navigator !== 'undefined' ? navigator.userAgent : '',
       'X-Click-Count': String(this.clickCount),
       'X-Keypress-Count': String(this.keypressCount),
+      ...(serviceName ? { 'X-Replay-Service-Name': serviceName } : {}),
     };
+  }
+
+  /** Return only a bounded, non-control service discriminator for the server. */
+  private boundedServiceName(): string {
+    const serviceName = this.config.serviceName.trim();
+    if (serviceName.length === 0 || serviceName.length > 255 || /[\u0000-\u001f\u007f]/.test(serviceName)) {
+      return '';
+    }
+    return serviceName;
   }
 
   /**
