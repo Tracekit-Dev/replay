@@ -10,6 +10,48 @@ vi.mock('rrweb', () => ({ record: recordMock }));
 const config = () => resolveReplayConfig({ unmask: ['.public'], block: ['.secret'] }, 'test-key', 'https://api.test');
 
 describe('privacy sanitizer', () => {
+  it('rejects a remove with an existing but inconsistent parent and stays failed until FullSnapshot', () => {
+    const sanitizer = new ReplayPrivacySanitizer(resolveReplayConfig({ unmask: ['.public'] }, 'test-key', 'https://api.test'));
+    const snapshot = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+      { type: 2, id: 2, tagName: 'div', attributes: {}, childNodes: [{ type: 3, id: 3, textContent: 'safe' }] },
+      { type: 2, id: 4, tagName: 'div', attributes: { class: 'public' }, childNodes: [] },
+    ] } } };
+    expect(sanitizer.sanitize(snapshot)).not.toBeNull();
+    const forged = { type: 3, timestamp: 2, data: { source: 0, adds: [], texts: [], attributes: [], removes: [{ parentId: 4, id: 2 }] } };
+    expect(sanitizer.sanitize(forged)).toBeNull();
+    const reuse = { type: 3, timestamp: 3, data: { source: 0, adds: [{ parentId: 4, node: { type: 2, id: 2, tagName: 'div', attributes: {}, childNodes: [{ type: 3, id: 5, textContent: 'synthetic-secret-canary' }] } }], texts: [], attributes: [], removes: [] } };
+    expect(sanitizer.sanitize(reuse)).toBeNull();
+    expect(sanitizer.sanitize({ ...snapshot, timestamp: 4 })).not.toBeNull();
+    expect(sanitizer.sanitize({ ...reuse, timestamp: 5 })).toBeNull();
+  });
+
+  it('does not partially commit an earlier valid remove before a later forged remove', () => {
+    const states = new Map<number, any>();
+    const resolved = resolveReplayConfig({ unmask: ['.public'] }, 'test-key', 'https://api.test');
+    const snapshot = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+      { type: 2, id: 2, tagName: 'div', attributes: {}, childNodes: [{ type: 3, id: 3, textContent: 'safe' }] },
+      { type: 2, id: 4, tagName: 'div', attributes: { class: 'public' }, childNodes: [] },
+    ] } } };
+    expect(sanitizeReplayEvent(snapshot, resolved, states)).not.toBeNull();
+    const before = [...states.entries()];
+    expect(sanitizeReplayEvent({ type: 3, timestamp: 2, data: { source: 0, adds: [], texts: [], attributes: [], removes: [
+      { parentId: 2, id: 3 }, { parentId: 4, id: 2 },
+    ] } }, resolved, states)).toBeNull();
+    expect([...states.entries()]).toEqual(before);
+  });
+
+  it('permits valid subtree removal and later reuse of its rrweb IDs', () => {
+    const sanitizer = new ReplayPrivacySanitizer(resolveReplayConfig({ unmask: ['.public'] }, 'test-key', 'https://api.test'));
+    expect(sanitizer.sanitize({ type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+      { type: 2, id: 2, tagName: 'div', attributes: {}, childNodes: [{ type: 3, id: 3, textContent: 'safe' }] },
+      { type: 2, id: 4, tagName: 'div', attributes: { class: 'public' }, childNodes: [] },
+    ] } } })).not.toBeNull();
+    expect(sanitizer.sanitize({ type: 3, timestamp: 2, data: { source: 0, adds: [], texts: [], attributes: [], removes: [{ parentId: 1, id: 2 }] } })).not.toBeNull();
+    const reused = sanitizer.sanitize({ type: 3, timestamp: 3, data: { source: 0, adds: [{ parentId: 4, node: {
+      type: 2, id: 2, tagName: 'div', attributes: {}, childNodes: [{ type: 3, id: 3, textContent: 'allowed' }],
+    } }], texts: [], attributes: [], removes: [] } });
+    expect(JSON.stringify(reused)).toContain('allowed');
+  });
   it.each([['self', 2], ['ancestor', 1], ['descendant', 3]])('rejects %s rrweb ID collisions and closes ancestry', (_name, collisionId) => {
     const sanitizer = new ReplayPrivacySanitizer(resolveReplayConfig({ unmask: ['.public'] }, 'test-key', 'https://api.test'));
     const snapshot = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
