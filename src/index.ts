@@ -71,6 +71,7 @@ export function replayIntegration(
           manuallyStopped = true;
           return;
         }
+        manuallyStopped = false;
         const scope = client.getScope();
         let identityUserId = '';
         try { identityUserId = String(scope?.getUser?.()?.id ?? ''); } catch { identityUserId = ''; }
@@ -119,6 +120,17 @@ export function replayIntegration(
         // in OTLP output -- extras would prefix it as "extra.replay_id".
         const originalCaptureException = client.captureException;
         if (typeof originalCaptureException === 'function') {
+          const previousReplayTag = (() => {
+            try {
+              const tags = client.getScope()?.getTags?.() ?? {};
+              return {
+                present: Object.prototype.hasOwnProperty.call(tags, 'replay_id'),
+                value: typeof tags.replay_id === 'string' ? tags.replay_id : '',
+              };
+            } catch {
+              return { present: false, value: '' };
+            }
+          })();
           const wrappedCaptureException = function (this: unknown, error: Error, context?: any): string {
             const replayId = session?.getSessionId() ?? '';
             const captureScope = client.getScope();
@@ -127,7 +139,9 @@ export function replayIntegration(
               return originalCaptureException.call(this, error, context);
             } finally {
               if (replayId) {
-                try { captureScope.setTag('replay_id', ''); } catch { /* Host scope may be tearing down. */ }
+                try {
+                  captureScope.setTag('replay_id', previousReplayTag.present ? previousReplayTag.value : '');
+                } catch { /* Host scope may be tearing down. */ }
               }
               session?.onError();
             }

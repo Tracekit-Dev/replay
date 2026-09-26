@@ -36,6 +36,9 @@ export class ReplayTransport {
   private allocateSegmentFn: (() => ReplaySegmentAllocation) | null = null;
   private identityFn: (() => ReplayIdentity) | null = null;
   private pendingIdentity: ReplayIdentity | null = null;
+  private generation = 0;
+  private activeRequests = new Set<AbortController>();
+  private retryWaiters = new Map<ReturnType<typeof setTimeout>, (active: boolean) => void>();
 
   // Interaction counters (accumulated across all chunks)
   private clickCount = 0;
@@ -72,6 +75,7 @@ export class ReplayTransport {
     allocateSegment?: () => ReplaySegmentAllocation,
     getIdentity?: () => ReplayIdentity,
   ): void {
+    this.stop();
     this.sessionIdFn = getSessionId;
     this.segmentIdFn = nextSegmentId;
     this.replayTypeFn = getReplayType;
@@ -104,10 +108,23 @@ export class ReplayTransport {
    */
   destroy(): void {
     this.stop();
+    this.cancel();
+  }
+
+  /** Invalidate asynchronous work and discard all local pending data. */
+  cancel(): void {
+    this.generation += 1;
     this.pendingEvents = [];
     this.bufferSize = 0;
     this.recordingWindowStart = null;
     this.pendingIdentity = null;
+    for (const controller of this.activeRequests) controller.abort();
+    this.activeRequests.clear();
+    for (const [timer, resolve] of this.retryWaiters) {
+      clearTimeout(timer);
+      this.retryWaiters.delete(timer);
+      resolve(false);
+    }
   }
 
   /** Start a visible recorder interval. Hidden time never belongs to a chunk. */
@@ -210,6 +227,7 @@ export class ReplayTransport {
    * Returns silently if no events are pending.
    */
   async flush(): Promise<void> {
+    const generation = this.generation;
     this.appendRecordingBoundaries();
     if (this.pendingEvents.length === 0) {
       return;
@@ -223,6 +241,7 @@ export class ReplayTransport {
     this.pendingIdentity = null;
 
     try {
+      if (!this.isCurrent(generation)) return;
       const allocation = this.allocateSegmentFn?.() ?? {
         sessionId: this.sessionIdFn ? this.sessionIdFn() : '',
         segmentId: this.segmentIdFn ? this.segmentIdFn() : 0,
@@ -242,9 +261,11 @@ export class ReplayTransport {
 
       // Compress via worker (or main-thread fallback)
       const { compressed, originalSize } = await this.compressionWorker.compress(events, segmentId);
+      if (!this.isCurrent(generation)) return;
 
       // Upload with retry
-      await this.uploadWithRetry(sessionId, compressed, originalSize, headers);
+      await this.uploadWithRetry(sessionId, compressed, originalSize, headers, generation);
+      if (!this.isCurrent(generation)) return;
     } catch {
       // Drop chunk on any unexpected error -- replay data loss is acceptable
     }
@@ -353,15 +374,21 @@ export class ReplayTransport {
     compressed: Uint8Array,
     originalSize: number,
     headers: Record<string, string>,
+    generation: number,
   ): Promise<void> {
     const url = `${this.config.endpoint}/api/replays/${sessionId}/chunks`;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      if (!this.isCurrent(generation)) return;
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      if (controller) this.activeRequests.add(controller);
       try {
         const response = await fetch(url, {
           method: 'POST',
           headers: { ...headers, 'X-Original-Size': String(originalSize) },
           body: compressed as unknown as BodyInit,
+          ...(controller ? { signal: controller.signal } : {}),
         });
+        if (!this.isCurrent(generation)) return;
 
         if (response.ok) {
           return; // Success
@@ -374,13 +401,16 @@ export class ReplayTransport {
 
         // Retryable failure -- wait before next attempt
         if (attempt < MAX_ATTEMPTS - 1) {
-          await this.delay(RETRY_DELAYS[attempt]);
+          if (!(await this.delay(RETRY_DELAYS[attempt], generation))) return;
         }
       } catch {
+        if (!this.isCurrent(generation)) return;
         // Network error -- wait before retry
         if (attempt < MAX_ATTEMPTS - 1) {
-          await this.delay(RETRY_DELAYS[attempt]);
+          if (!(await this.delay(RETRY_DELAYS[attempt], generation))) return;
         }
+      } finally {
+        if (controller) this.activeRequests.delete(controller);
       }
     }
 
@@ -416,7 +446,21 @@ export class ReplayTransport {
   /**
    * Promise-based delay for retry backoff.
    */
-  private delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  private delay(ms: number, generation: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (!this.isCurrent(generation)) {
+        resolve(false);
+        return;
+      }
+      const timer = setTimeout(() => {
+        this.retryWaiters.delete(timer);
+        resolve(this.isCurrent(generation));
+      }, ms);
+      this.retryWaiters.set(timer, resolve);
+    });
+  }
+
+  private isCurrent(generation: number): boolean {
+    return this.generation === generation;
   }
 }

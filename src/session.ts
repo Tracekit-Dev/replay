@@ -455,6 +455,7 @@ export class SessionManager {
 
   private ensureIdentitySafety(): void {
     if (this.rotating || this.manuallyStopped) return;
+    if (!this.active) return;
     const userIdentity = this.readUserIdentity();
     if (userIdentity !== this.identityUserId) {
       this.rotatingUserId = this.identityUserId;
