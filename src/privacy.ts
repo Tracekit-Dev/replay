@@ -538,8 +538,14 @@ export class ReplayPrivacySanitizer {
       this.failed = true;
       return null;
     }
-    if (this.failed && isFullSnapshot && !safe?.data?.node) return null;
-    if (isFullSnapshot && safe?.data?.node) this.failed = false;
+    if (isFullSnapshot && safe?.data?.node && safe.data.node.type !== 0) {
+      this.states.clear();
+      this.tokens.clear();
+      this.failed = true;
+      return null;
+    }
+    if (this.failed && isFullSnapshot && safe?.data?.node?.type !== 0) return null;
+    if (isFullSnapshot && safe?.data?.node?.type === 0) this.failed = false;
     if (this.states.size > MAX_NODES) {
       this.clear();
       this.failed = true;
