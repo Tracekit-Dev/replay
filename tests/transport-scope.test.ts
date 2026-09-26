@@ -26,3 +26,26 @@ it('sends one bounded service name with asynchronous and beacon uploads', async 
   expect(beaconURL.searchParams.has('project_id')).toBe(false);
   transport.destroy();
 });
+
+for (const invalidName of ['x'.repeat(256), 'checkout\u0000api']) {
+  it(`drops fetch and beacon uploads for invalid configured service ${JSON.stringify(invalidName.slice(0, 16))}`, async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    const beacon = vi.fn().mockReturnValue(true);
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('navigator', { userAgent: 'test', sendBeacon: beacon });
+    const config = resolveReplayConfig({}, 'test-key', 'https://example.test');
+    config.serviceName = invalidName;
+    const worker = { compress: vi.fn().mockResolvedValue({ compressed: new Uint8Array([1]), originalSize: 1 }) };
+    const transport = new ReplayTransport(config, worker as any);
+    let segment = 0;
+    transport.start(() => 'session-a', () => segment++, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent({ type: 2, timestamp: 100 });
+    await transport.flush();
+    transport.addEvent({ type: 2, timestamp: 200 });
+    transport.flushSync();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(beacon).not.toHaveBeenCalled();
+    transport.destroy();
+  });
+}
