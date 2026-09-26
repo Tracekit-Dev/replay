@@ -49,6 +49,7 @@ export class ReplayTransport {
   private cancelled = false;
   private awaitingSnapshot = false;
   private retainedBufferHistory = false;
+  private pendingRegionHadSnapshot = false;
   private activeCompressions = 0;
   private listeners = new Set<ReplayStatusListener>();
   private publishQueued = false;
@@ -191,6 +192,7 @@ export class ReplayTransport {
     this.cancelled = true;
     this.pendingEvents = [];
     this.bufferSize = 0;
+    this.pendingRegionHadSnapshot = false;
     this.recordingWindowStart = null;
     this.pendingIdentity = null;
     for (const controller of this.activeRequests) controller.abort();
@@ -299,6 +301,7 @@ export class ReplayTransport {
       if (event?.type === 2) {
         this.pendingEvents = [];
         this.bufferSize = 0;
+        this.pendingRegionHadSnapshot = false;
         this.awaitingSnapshot = true;
         this.retainedBufferHistory = this.replayTypeFn?.() === 'buffer';
       }
@@ -307,6 +310,7 @@ export class ReplayTransport {
     if (event?.type === 2) {
       this.awaitingSnapshot = false;
       this.retainedBufferHistory = false;
+      this.pendingRegionHadSnapshot = true;
     }
     if (prepend) this.pendingEvents.unshift(event);
     else this.pendingEvents.push(event);
@@ -331,6 +335,7 @@ export class ReplayTransport {
         const dropped = this.pendingEvents[0];
         this.pendingEvents = [];
         this.bufferSize = 0;
+        this.pendingRegionHadSnapshot = false;
         this.status.droppedEvents++;
         if (dropped?.type === 2) {
           this.awaitingSnapshot = true;
@@ -352,19 +357,21 @@ export class ReplayTransport {
       this.status.droppedEvents += this.pendingEvents.length;
       this.pendingEvents = [];
       this.bufferSize = 0;
+      this.pendingRegionHadSnapshot = false;
       this.publish('snapshot_required');
     }
   }
 
   private removePendingOrphans(): void {
     const snapshot = this.pendingEvents.findIndex((event) => event?.type === 2);
-    if (snapshot < 0 && this.pendingEvents.length > 0) {
+    if (snapshot < 0 && this.pendingRegionHadSnapshot && this.pendingEvents.length > 0) {
       this.awaitingSnapshot = true;
       this.retainedBufferHistory = this.replayTypeFn?.() === 'buffer';
       if (!this.retainedBufferHistory) {
         this.status.droppedEvents += this.pendingEvents.length;
         this.pendingEvents = [];
         this.bufferSize = 0;
+        this.pendingRegionHadSnapshot = false;
         this.publish('snapshot_required');
       }
       return;
@@ -404,6 +411,7 @@ export class ReplayTransport {
     const events = this.pendingEvents;
     this.pendingEvents = [];
     this.bufferSize = 0;
+    this.pendingRegionHadSnapshot = false;
     const flushedBufferedHistory = this.retainedBufferHistory;
     if (flushedBufferedHistory) this.retainedBufferHistory = false;
     const pendingIdentity = this.pendingIdentity;
