@@ -153,6 +153,30 @@ describe('Replay session identity', () => {
     clone.destroy();
   });
 
+  it('rejects copied storage after the copied tab reloads before Replay starts', async () => {
+    const originalStorage = storage();
+    const sharedCounter = storage();
+    vi.stubGlobal('navigator', { locks: new FakeLocks() });
+    vi.stubGlobal('sessionStorage', originalStorage);
+    vi.stubGlobal('localStorage', sharedCounter);
+    const first = await createManager();
+    expect(first.nextSegmentId()).toBe(0);
+    const firstId = first.getSessionId();
+    const copiedStorage = storage(new Map(originalStorage.values));
+    first.destroy();
+    vi.stubGlobal('sessionStorage', copiedStorage);
+    vi.stubGlobal('location', { href: 'https://example.test/replay' });
+    vi.stubGlobal('performance', { getEntriesByType: (name: string) => name === 'navigation' ? [{ type: 'reload', name: 'https://example.test/replay' }] : [] });
+    const clone = new SessionManager(config());
+    const initialId = clone.getState().sessionId;
+    expect(initialId).not.toBe(firstId);
+    await clone.ready();
+    expect(clone.getSessionId()).not.toBe(firstId);
+    expect(clone.getSessionId()).toBe(initialId);
+    expect(clone.nextSegmentId()).toBe(0);
+    clone.destroy();
+  });
+
   it('uses fresh document identity when storage is blocked or ownership proof is absent', async () => {
     const blocked = { getItem: () => { throw new Error('blocked'); }, setItem: () => { throw new Error('blocked'); } };
     vi.stubGlobal('sessionStorage', blocked);
