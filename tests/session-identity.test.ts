@@ -233,7 +233,9 @@ describe('Replay session identity', () => {
     first.destroy();
     const previous = JSON.parse(shared.values.get(key)!);
     shared.values.set(key, JSON.stringify({ ...previous, segmentId: 0x7fff_fffe }));
-    sharedCounter.values.set(`${key}_${previous.sessionId}`, String(0x7fff_fffe));
+    sharedCounter.values.set(`${key}_${previous.sessionId}`, JSON.stringify({ next: 0x7fff_fffe, expiresAt: Date.now() + config().idleTimeout }));
+    vi.stubGlobal('location', { href: 'https://example.test/replay' });
+    vi.stubGlobal('performance', { getEntriesByType: (name: string) => name === 'navigation' ? [{ type: 'reload', name: 'https://example.test/replay' }] : [] });
     const manager = await createManager();
     const oldId = manager.getSessionId();
     expect(manager.nextSegmentId()).toBe(0x7fff_fffe);

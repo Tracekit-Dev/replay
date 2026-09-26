@@ -39,8 +39,11 @@ describe('SessionManager lifecycle', () => {
 
   beforeEach(() => {
     vi.stubGlobal('localStorage', {
+      get length() { return sharedCounters.size; },
+      key: (index: number) => [...sharedCounters.keys()][index] ?? null,
       getItem: (key: string) => sharedCounters.get(key) ?? null,
       setItem: (key: string, value: string) => sharedCounters.set(key, value),
+      removeItem: (key: string) => sharedCounters.delete(key),
     });
   });
 
@@ -123,6 +126,8 @@ describe('SessionManager lifecycle', () => {
     expect(first.getMode()).toBe('off');
     first.nextSegmentId();
     first.destroy();
+    vi.stubGlobal('location', { href: 'http://localhost/replay' });
+    vi.stubGlobal('performance', { getEntriesByType: (name: string) => name === 'navigation' ? [{ type: 'reload', name: 'http://localhost/replay' }] : [] });
     const second = new SessionManager({ ...config(), sessionSampleRate: 1 });
     await second.ready();
     expect(second.getMode()).toBe('off');

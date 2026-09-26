@@ -25,6 +25,46 @@ const STORAGE_PREFIX = '__tracekit_replay_session_v2_';
 const MAX_SEGMENT_ID = 0x7fff_fffe;
 const ID_PATTERN = /^[0-9a-f]{32}$/;
 
+function verifiedReload(): boolean {
+  if (typeof performance === 'undefined' || typeof location === 'undefined') return false;
+  try {
+    const entries = performance.getEntriesByType('navigation');
+    if (entries.length !== 1) return false;
+    const entry = entries[0] as PerformanceNavigationTiming;
+    return entry.type === 'reload' && new URL(entry.name).href === new URL(location.href).href;
+  } catch { return false; }
+}
+
+function sharedCounter(raw: string | null): { next: number; expiresAt: number } | null {
+  if (!raw) return null;
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (!value || typeof value !== 'object') return null;
+    const item = value as { next?: unknown; expiresAt?: unknown };
+    if (!Number.isSafeInteger(item.next) || (item.next as number) < 0 || (item.next as number) > MAX_SEGMENT_ID + 1) return null;
+    if (!Number.isFinite(item.expiresAt) || (item.expiresAt as number) <= 0) return null;
+    return { next: item.next as number, expiresAt: item.expiresAt as number };
+  } catch { return null; }
+}
+
+function counterValue(next: number, idleTimeout: number): string {
+  return JSON.stringify({ next, expiresAt: Date.now() + idleTimeout });
+}
+
+function cleanExpiredCounters(namespace: string): void {
+  try {
+    const keys: string[] = [];
+    for (let index = 0; index < localStorage.length; index++) {
+      const key = localStorage.key(index);
+      if (key?.startsWith(`${namespace}_`) && ID_PATTERN.test(key.slice(namespace.length + 1))) keys.push(key);
+    }
+    for (const key of keys) {
+      const current = sharedCounter(localStorage.getItem(key));
+      if (!current || current.expiresAt <= Date.now()) localStorage.removeItem(key);
+    }
+  } catch { /* Storage can be blocked; never depend on cleanup for identity safety. */ }
+}
+
 /**
  * Generate a 32-character hex session ID.
  * A cryptographic source is required because IDs are server object identities.
@@ -137,13 +177,14 @@ export class SessionManager {
   private async initializeIdentity(): Promise<void> {
     const key = await storageNamespace(this.config);
     if (this.destroyed) return;
-    if (key && typeof sessionStorage !== 'undefined' && typeof navigator !== 'undefined' && navigator.locks) {
+    if (key && typeof localStorage !== 'undefined') cleanExpiredCounters(key);
+    if (!this.keepFreshForPageview && key && typeof sessionStorage !== 'undefined' && typeof navigator !== 'undefined' && navigator.locks) {
       try {
         const raw = sessionStorage.getItem(key);
         const stored: unknown = raw ? JSON.parse(raw) : null;
-        if (!this.keepFreshForPageview && validStored(stored, this.config) && await this.claim(key, stored.sessionId)) {
-          const current = localStorage.getItem(`${key}_${stored.sessionId}`);
-          if (current === String(stored.segmentId)) {
+        if (verifiedReload() && validStored(stored, this.config) && await this.claim(key, stored.sessionId)) {
+          const current = sharedCounter(localStorage.getItem(`${key}_${stored.sessionId}`));
+          if (current?.next === stored.segmentId && current.expiresAt > Date.now()) {
             this.state = { ...stored, startedAt: Date.now(), lastActivity: Date.now() };
             this.storageKey = key;
           } else {
@@ -159,8 +200,9 @@ export class SessionManager {
         try {
           const counterKey = `${key}_${this.state.sessionId}`;
           if (localStorage.getItem(counterKey) === null) {
-            localStorage.setItem(counterKey, '0');
-            if (localStorage.getItem(counterKey) === '0') this.storageKey = key;
+            const initial = counterValue(0, this.config.idleTimeout);
+            localStorage.setItem(counterKey, initial);
+            if (localStorage.getItem(counterKey) === initial) this.storageKey = key;
           }
         } catch { /* No shared counter means no reload continuity. */ }
         if (!this.storageKey) {
@@ -205,6 +247,10 @@ export class SessionManager {
   private persistSession(): void {
     if (!this.storageKey || !this.releaseClaim || this.destroyed) return;
     try {
+      const counterKey = `${this.storageKey}_${this.state.sessionId}`;
+      const current = sharedCounter(localStorage.getItem(counterKey));
+      if (current?.next !== this.state.segmentId || current.expiresAt <= Date.now()) return;
+      localStorage.setItem(counterKey, counterValue(this.state.segmentId, this.config.idleTimeout));
       sessionStorage.setItem(this.storageKey, JSON.stringify({
         sessionId: this.state.sessionId, segmentId: this.state.segmentId,
         mode: this.state.mode, lastActivity: this.state.lastActivity,
@@ -350,9 +396,10 @@ export class SessionManager {
     if (this.storageKey) {
       try {
         const counterKey = `${this.storageKey}_${this.state.sessionId}`;
-        if (localStorage.getItem(counterKey) !== String(next)) throw new Error('stale counter');
-        localStorage.setItem(counterKey, String(next + 1));
-        if (localStorage.getItem(counterKey) !== String(next + 1)) throw new Error('counter write failed');
+        const current = sharedCounter(localStorage.getItem(counterKey));
+        if (current?.next !== next || current.expiresAt <= Date.now()) throw new Error('stale counter');
+        localStorage.setItem(counterKey, counterValue(next + 1, this.config.idleTimeout));
+        if (sharedCounter(localStorage.getItem(counterKey))?.next !== next + 1) throw new Error('counter write failed');
       } catch {
         this.rotateIdentity();
         queueMicrotask(() => { if (!this.destroyed) this.restartCallback?.(); });
@@ -368,7 +415,9 @@ export class SessionManager {
   rotateIdentity(): void {
     if (this.storageKey) {
       try { sessionStorage.setItem(this.storageKey, ''); } catch { /* No persistent identity remains usable. */ }
-      try { localStorage.setItem(`${this.storageKey}_${this.state.sessionId}`, 'invalid'); } catch { /* No restore is allowed without a valid shared counter. */ }
+      const counterKey = `${this.storageKey}_${this.state.sessionId}`;
+      try { localStorage.removeItem(counterKey); }
+      catch { try { localStorage.setItem(counterKey, 'invalid'); } catch { /* A later restore still requires lineage proof. */ } }
     }
     this.releaseClaim?.();
     this.releaseClaim = null;
