@@ -56,6 +56,12 @@ export interface ReplayConfig {
    * to also capture image content). (default: true)
    */
   blockMedia?: boolean;
+
+  /**
+   * Stable service or project discriminator from the Browser client.
+   * It namespaces persisted replay state without storing credentials.
+   */
+  serviceName?: string;
 }
 
 /** Fully resolved config with all defaults applied */
@@ -68,6 +74,10 @@ export interface ResolvedReplayConfig {
   maxBufferSize: number;
   inlineImages: boolean;
   blockMedia: boolean;
+  /** Stable service discriminator used for replay storage namespacing. */
+  serviceName: string;
+  /** Initial user boundary. This value is never persisted. */
+  identityUserId: string;
   /** Inherited from BrowserClient */
   apiKey: string;
   /** Inherited from BrowserClient */
