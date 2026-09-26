@@ -117,4 +117,140 @@ describe('Replay privacy sanitizer', () => {
     Object.defineProperty(unsafe, 'data', { get: () => { throw new Error('unsafe getter'); } });
     expect(sanitizeReplayEvent(unsafe)).toBeNull();
   });
+
+  it('constructs bounded snapshot and navigation events without callable serialization hooks', () => {
+    const snapshot: Record<string, unknown> = {
+      type: 2,
+      timestamp: 1,
+      toJSON: () => ({ leaked: CANARY }),
+      data: {
+        toJSON: () => ({ leaked: CANARY }),
+        node: {
+          type: 2,
+          id: 1,
+          tagName: 'main',
+          attributes: {},
+          childNodes: [{
+            type: 3,
+            id: 2,
+            textContent: 'public text',
+            toJSON: () => ({ leaked: CANARY }),
+            extra: CANARY,
+          }],
+          toJSON: () => ({ leaked: CANARY }),
+        },
+      },
+    };
+    const navigation = {
+      type: 4,
+      timestamp: 2,
+      data: {
+        href: 'https://example.test/path?query=one#fragment',
+        pageUrl: 'https://example.test/page?query=two#fragment',
+        toJSON: () => ({ leaked: CANARY }),
+      },
+    };
+
+    const safeSnapshot = sanitizeReplayEvent(snapshot);
+    const safeNavigation = sanitizeReplayEvent(navigation);
+
+    expect(safeSnapshot).not.toBeNull();
+    expect(safeNavigation).not.toBeNull();
+    expect(JSON.stringify(safeSnapshot)).not.toContain(CANARY);
+    expect(JSON.stringify(safeSnapshot)).not.toContain('toJSON');
+    expect(JSON.stringify(safeNavigation)).not.toContain('toJSON');
+    expect((safeNavigation as any).data.href).toBe('https://example.test/path');
+    expect((safeNavigation as any).data.pageUrl).toBe('https://example.test/page');
+  });
+
+  it('redacts markers after unmask decisions and blocks media descendants', () => {
+    const event = {
+      type: 2,
+      timestamp: 1,
+      data: {
+        node: {
+          type: 2,
+          id: 1,
+          tagName: 'section',
+          attributes: { class: 'public' },
+          childNodes: [
+            { type: 3, id: 2, textContent: `visible ${CANARY}` },
+            {
+              type: 2,
+              id: 3,
+              tagName: 'img',
+              attributes: {},
+              childNodes: [{ type: 3, id: 4, textContent: CANARY }],
+            },
+          ],
+        },
+      },
+    };
+    const safe = sanitizeReplayEvent(event, { unmask: ['.public'] });
+
+    expect(safe).not.toBeNull();
+    expect(JSON.stringify(safe)).not.toContain(CANARY);
+    const children = (safe as any).data.node.childNodes;
+    expect(children[0].textContent).toBe('[REDACTED]');
+    expect(children[1].childNodes[0].textContent).toMatch(/^\*+$/);
+  });
+
+  it('sanitizes camelCase URL fields and stack URLs without marker words', () => {
+    const event = {
+      type: 5,
+      timestamp: 1,
+      data: {
+        tag: 'metadata',
+        payload: {
+          pageUrl: 'https://user:pass@example.test/page?query=one#fragment',
+          requestUrl: 'https://user:pass@example.test/request?query=two#fragment',
+          documentURL: 'https://user:pass@example.test/document?query=three#fragment',
+          stack: 'Error at https://user:pass@example.test/app.js?query=four#fragment:1:2',
+        },
+      },
+    };
+    const safe = sanitizeReplayEvent(event);
+
+    expect(safe).not.toBeNull();
+    const json = JSON.stringify(safe);
+    expect(json).not.toContain('user:pass');
+    expect(json).not.toContain('?query=');
+    expect(json).not.toContain('#fragment');
+    expect((safe as any).data.payload.pageUrl).toBe('https://example.test/page');
+    expect((safe as any).data.payload.requestUrl).toBe('https://example.test/request');
+    expect((safe as any).data.payload.documentURL).toBe('https://example.test/document');
+  });
+
+  it('constructs mutation and custom event shapes without top-level canaries', () => {
+    const mutation = sanitizeReplayEvent({
+      type: 3,
+      timestamp: 1,
+      canary: CANARY,
+      data: {
+        source: 0,
+        canary: CANARY,
+        texts: [{ id: 1, value: CANARY, canary: CANARY }],
+        attributes: [{ id: 2, attributes: { title: CANARY }, canary: CANARY }],
+        adds: [{ parentId: 1, nextId: null, node: {
+          type: 3,
+          id: 3,
+          textContent: CANARY,
+          canary: CANARY,
+        }, canary: CANARY }],
+      },
+    });
+    const custom = sanitizeReplayEvent({
+      type: 5,
+      timestamp: 2,
+      canary: CANARY,
+      data: {
+        tag: 'custom',
+        payload: { canary: CANARY, toJSON: () => ({ leaked: CANARY }) },
+      },
+    });
+
+    expect(JSON.stringify(mutation)).not.toContain(CANARY);
+    expect(JSON.stringify(custom)).not.toContain(CANARY);
+    expect(JSON.stringify(custom)).not.toContain('toJSON');
+  });
 });

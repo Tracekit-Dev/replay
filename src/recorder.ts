@@ -74,7 +74,7 @@ export function startRecording(
   try {
     const stopFn = record({
       emit: (event, isCheckout) => {
-        const safeEvent = sanitizeReplayEvent(event, { unmask: config.unmask });
+        const safeEvent = sanitizeReplayEvent(event, { unmask: config.unmask, blockMedia: config.blockMedia });
         if (safeEvent) onEvent(safeEvent, isCheckout ?? false);
       },
 

@@ -171,7 +171,7 @@ export class ReplayTransport {
   addEvent(event: any): void {
     try {
       if (this.cancelled) return;
-      const safeEvent = sanitizeReplayEvents([event], { unmask: this.config.unmask })[0];
+      const safeEvent = sanitizeReplayEvents([event], { unmask: this.config.unmask, blockMedia: this.config.blockMedia })[0];
       if (!safeEvent) return;
       event = safeEvent;
       if (this.pendingEvents.length === 0 && this.identityFn) {
@@ -267,7 +267,7 @@ export class ReplayTransport {
         return; // Do not attribute events across an identity boundary.
       }
 
-      const safeEvents = sanitizeReplayEvents(events, { unmask: this.config.unmask });
+      const safeEvents = sanitizeReplayEvents(events, { unmask: this.config.unmask, blockMedia: this.config.blockMedia });
       if (safeEvents.length === 0) return;
 
       const headers = this.uploadHeaders(segmentId, allocation.userId, allocation.mode);
@@ -324,7 +324,7 @@ export class ReplayTransport {
         return;
       }
 
-      const safeEvents = sanitizeReplayEvents(events, { unmask: this.config.unmask });
+      const safeEvents = sanitizeReplayEvents(events, { unmask: this.config.unmask, blockMedia: this.config.blockMedia });
       if (safeEvents.length === 0 || !this.isCurrent(generation)) return;
 
       // Compress on main thread (sync -- sendBeacon requires sync data)

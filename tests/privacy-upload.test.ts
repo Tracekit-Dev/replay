@@ -45,6 +45,57 @@ function event() {
   };
 }
 
+function adversarialEvents() {
+  return [
+    {
+      type: 2,
+      timestamp: 2,
+      toJSON: () => ({ leaked: CANARY }),
+      data: {
+        toJSON: () => ({ leaked: CANARY }),
+        node: {
+          type: 2,
+          id: 10,
+          tagName: 'main',
+          attributes: {},
+          childNodes: [{ type: 3, id: 11, textContent: CANARY, toJSON: () => ({ leaked: CANARY }) }],
+        },
+      },
+    },
+    {
+      type: 4,
+      timestamp: 3,
+      data: {
+        href: 'https://user:pass@example.test/path?query=one#fragment',
+        pageUrl: 'https://user:pass@example.test/page?query=two#fragment',
+      },
+    },
+    {
+      type: 3,
+      timestamp: 4,
+      data: {
+        source: 0,
+        texts: [{ id: 11, value: CANARY }],
+        attributes: [{ id: 10, attributes: { requestUrl: 'https://user:pass@example.test/request?query=three#fragment' } }],
+        adds: [],
+      },
+    },
+    {
+      type: 5,
+      timestamp: 5,
+      data: {
+        tag: 'custom',
+        payload: {
+          documentURL: 'https://user:pass@example.test/document?query=four#fragment',
+          stack: 'Error at https://user:pass@example.test/app.js?query=five#fragment:1:2',
+          toJSON: () => ({ leaked: CANARY }),
+          canary: CANARY,
+        },
+      },
+    },
+  ];
+}
+
 describe('Replay privacy upload boundary', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -126,5 +177,52 @@ describe('Replay privacy upload boundary', () => {
     transport.flushSync();
     expect(fetchMock).not.toHaveBeenCalled();
     expect(beaconMock).not.toHaveBeenCalled();
+  });
+
+  it('sanitizes every supported event shape in decompressed fetch and beacon bodies', async () => {
+    const requests: Array<[string, RequestInit]> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      requests.push([url, init]);
+      return new Response('', { status: 202 });
+    }));
+    vi.stubGlobal('navigator', {
+      sendBeacon: vi.fn(() => true),
+      userAgent: 'safe-browser',
+    });
+
+    const fetchTransport = new ReplayTransport(config(), worker());
+    fetchTransport.start(() => 'd'.repeat(32), () => 0, () => 'session', () => '/', () => '');
+    adversarialEvents().forEach((item) => fetchTransport.addEvent(item));
+    await fetchTransport.flush();
+    expect(requests).toHaveLength(1);
+    const fetchBytes = new Uint8Array(requests[0][1].body as ArrayBuffer);
+    const fetchBody = new TextDecoder().decode(gunzipSync(fetchBytes));
+    expect(fetchBody).not.toContain(CANARY);
+    expect(fetchBody).not.toContain('toJSON');
+    expect(fetchBody).not.toContain('user:pass');
+    expect(fetchBody).not.toContain('?query=');
+    expect(fetchBody).not.toContain('#fragment');
+    fetchTransport.destroy();
+
+    const beacons: Array<[string, Blob]> = [];
+    vi.stubGlobal('navigator', {
+      sendBeacon: vi.fn((url: string, body: Blob) => {
+        beacons.push([url, body]);
+        return true;
+      }),
+      userAgent: 'safe-browser',
+    });
+    const beaconTransport = new ReplayTransport(config(), worker());
+    beaconTransport.start(() => 'e'.repeat(32), () => 0, () => 'session', () => '/', () => '');
+    adversarialEvents().forEach((item) => beaconTransport.addEvent(item));
+    beaconTransport.flushSync();
+    expect(beacons).toHaveLength(1);
+    const beaconBody = new TextDecoder().decode(gunzipSync(new Uint8Array(await beacons[0][1].arrayBuffer())));
+    expect(beaconBody).not.toContain(CANARY);
+    expect(beaconBody).not.toContain('toJSON');
+    expect(beaconBody).not.toContain('user:pass');
+    expect(beaconBody).not.toContain('?query=');
+    expect(beaconBody).not.toContain('#fragment');
+    beaconTransport.destroy();
   });
 });
