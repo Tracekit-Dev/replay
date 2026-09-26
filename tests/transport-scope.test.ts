@@ -27,7 +27,7 @@ it('sends one bounded service name with asynchronous and beacon uploads', async 
   transport.destroy();
 });
 
-for (const invalidName of ['x'.repeat(256), 'checkout\u0000api']) {
+for (const invalidName of ['x'.repeat(256), 'checkout\u0000api', 'checkout\u0085api']) {
   it(`drops fetch and beacon uploads for invalid configured service ${JSON.stringify(invalidName.slice(0, 16))}`, async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true });
     const beacon = vi.fn().mockReturnValue(true);
