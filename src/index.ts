@@ -129,12 +129,13 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
             const tags = scope.getTags?.() ?? {};
             const hadTag = Object.prototype.hasOwnProperty.call(tags, 'replay_id');
             const priorTag = tags.replay_id ?? '';
+            const canRestoreTag = hadTag || typeof scope.removeTag === 'function';
             try {
-              if (replayId) scope.setTag('replay_id', replayId);
+              if (replayId && canRestoreTag) scope.setTag('replay_id', replayId);
               return ownedPrevious.call(ownedClient, error, context);
             } finally {
-              if (replayId) {
-                if (hadTag || typeof scope.removeTag !== 'function') scope.setTag('replay_id', priorTag);
+              if (replayId && canRestoreTag) {
+                if (hadTag) scope.setTag('replay_id', priorTag);
                 else scope.removeTag('replay_id');
               }
               if (current(token)) ownedSession.onError();

@@ -95,6 +95,8 @@ Each allowed start after a stop uses a fresh document-local Replay ID.
 Replay uses owned breadcrumb subscriptions when the Browser SDK supports them.
 With older Browser bundles, Replay disables breadcrumb capture and reports a
 bounded compatibility reason. It does not replace a host breadcrumb listener.
+An older scope without tag removal keeps its prior tags unchanged. Replay then
+omits a temporary error link when no `replay_id` tag existed before capture.
 
 ## Documentation
 
