@@ -47,6 +47,7 @@ export function replayIntegration(
   let startRecordingPipeline: () => void = () => {};
   let stopRecordingPipeline: () => void = () => {};
   let installBreadcrumbBridge: () => void = () => {};
+  const hostRecordingEnabled = (): boolean => clientRef?.getConfig?.().enabled !== false;
 
   const integration: Integration & { start(): void; stop(): void; flush(): void; getSessionId(): string } = {
     name: 'replay',
@@ -66,7 +67,7 @@ export function replayIntegration(
         clientRef = client;
         // The host enabled flag is the existing consent mechanism. Do not
         // create session storage, workers, timers, or subscriptions when it is off.
-        if (!clientConfig.enabled) {
+        if (clientConfig.enabled === false) {
           manuallyStopped = true;
           return;
         }
@@ -88,7 +89,7 @@ export function replayIntegration(
         });
 
         startRecordingPipeline = () => {
-          if (!clientRef?.getConfig?.().enabled || manuallyStopped || !session || !resolvedConfig || !transport || !session.isActive() || !session.isVisible() || session.getMode() === 'off') return;
+          if (!hostRecordingEnabled() || manuallyStopped || !session || !resolvedConfig || !transport || !session.isActive() || !session.isVisible() || session.getMode() === 'off') return;
           if (stopRecording) return;
           transport!.startRecordingWindow();
           stopRecording = startRecording(resolvedConfig, (event, isCheckout) => {
@@ -273,7 +274,7 @@ export function replayIntegration(
     /** Start recording with a fresh identity after an explicit stop. */
     start(): void {
       try {
-        if (!manuallyStopped || !session || !resolvedConfig || !clientRef?.getConfig?.().enabled) return;
+        if (!manuallyStopped || !session || !resolvedConfig || !hostRecordingEnabled()) return;
         manuallyStopped = false;
         session.start();
         compressionWorker = new CompressionWorker();
