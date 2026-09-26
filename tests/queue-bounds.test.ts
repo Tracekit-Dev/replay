@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RingBuffer } from '../src/buffer';
 import { resolveReplayConfig } from '../src/config';
+import { SessionManager } from '../src/session';
 import { ReplayTransport } from '../src/transport';
 
 afterEach(() => {
@@ -84,5 +85,55 @@ describe('bounded replay queues', () => {
     expect(status.pendingBytes).toBeLessThanOrEqual(512);
     expect(status.droppedEvents).toBeGreaterThan(0);
     transport.destroy();
+  });
+
+  it('never uploads mutations after the baseline is evicted', async () => {
+    const uploaded: any[][] = [];
+    const worker = { compress: vi.fn(async (events: any[]) => {
+      uploaded.push(events);
+      return { compressed: new Uint8Array([1]), originalSize: 1 };
+    }) };
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 202 })));
+    const transport = new ReplayTransport(resolveReplayConfig({ maxBufferEvents: 3 }, 'key', 'https://example.test'), worker as any);
+    transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    const now = Date.now();
+    transport.addEvent({ type: 2, timestamp: now });
+    transport.addEvent({ type: 3, timestamp: now + 1 });
+    transport.addEvent({ type: 3, timestamp: now + 2 });
+    transport.addEvent({ type: 3, timestamp: now + 3 });
+    await transport.flush();
+    expect(uploaded).toHaveLength(0);
+    expect(transport.getStatus().droppedEvents).toBeGreaterThan(0);
+    transport.destroy();
+  });
+
+  it('stops an oversized baseline region until a fresh snapshot arrives', () => {
+    const worker = { compress: vi.fn() };
+    const transport = new ReplayTransport(resolveReplayConfig({ maxBufferSize: 128 }, 'key', 'https://example.test'), worker as any);
+    transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    const now = Date.now();
+    transport.addEvent({ type: 2, timestamp: now, data: { text: 'x'.repeat(1_000) } });
+    expect(transport.getStatus().lastReason).toBe('snapshot_too_large');
+    transport.addEvent({ type: 3, timestamp: now + 1, data: { text: 'orphan' } });
+    expect(transport.getStatus().pendingEvents).toBe(0);
+    expect(transport.getStatus().lastReason).toBe('snapshot_too_large');
+    transport.destroy();
+  });
+
+  it('applies resolved bounds to error-mode capture', () => {
+    const manager = new SessionManager(resolveReplayConfig({ sessionSampleRate: 0, errorSampleRate: 1, maxBufferEvents: 2, maxBufferSize: 128 }, 'key', 'https://example.test'));
+    let captured: any[] = [];
+    manager.setEventCallback((events) => { captured = events; });
+    const now = Date.now();
+    manager.onEvent({ type: 2, timestamp: now }, true);
+    manager.onEvent({ type: 3, timestamp: now + 1 }, false);
+    manager.onEvent({ type: 3, timestamp: now + 2 }, false);
+    manager.onError();
+    expect(captured.length).toBeLessThanOrEqual(2);
+    expect(captured[0]?.type).toBe(2);
+    expect(captured.reduce((total, event) => total + new TextEncoder().encode(JSON.stringify(event)).byteLength, 0)).toBeLessThanOrEqual(128);
+    manager.destroy();
   });
 });

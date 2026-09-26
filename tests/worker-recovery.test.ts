@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CompressionWorker } from '../src/compression';
+import { replayIntegration } from '../src/index';
 import { ReplayTransport } from '../src/transport';
 import { resolveReplayConfig } from '../src/config';
+
+vi.mock('rrweb', () => ({ record: vi.fn(() => vi.fn()), addCustomEvent: vi.fn() }));
 
 afterEach(() => {
   vi.useRealTimers();
@@ -102,5 +105,77 @@ describe('replay worker and delivery recovery', () => {
     expect(JSON.stringify(transport.getStatus())).not.toContain('secret');
     expect(JSON.stringify(transport.getStatus())).not.toContain('private.invalid');
     transport.destroy();
+  });
+
+  it('settles a hung fetch without AbortController', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_url: string, _init: RequestInit) => new Promise<Response>(() => {}));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('AbortController', undefined);
+    const worker = { compress: vi.fn(async () => ({ compressed: new Uint8Array([1]), originalSize: 1 })) };
+    const transport = new ReplayTransport(resolveReplayConfig({ fetchTimeoutMs: 20, retryMaxAgeMs: 20 }, 'key', 'https://example.test'), worker as any);
+    transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent({ type: 2, timestamp: Date.now() });
+    const flush = transport.flush();
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(flush).resolves.toBeUndefined();
+    expect(transport.getStatus().droppedChunks).toBe(1);
+    transport.destroy();
+  });
+
+  it('treats HTTP 409 as a terminal conflict', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 409 })));
+    const worker = { compress: vi.fn(async () => ({ compressed: new Uint8Array([1]), originalSize: 1 })) };
+    const transport = new ReplayTransport(resolveReplayConfig({ retryMaxAgeMs: 100 }, 'key', 'https://example.test'), worker as any);
+    transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent({ type: 2, timestamp: Date.now() });
+    await transport.flush();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(transport.getStatus().lastReason).toBe('http_409');
+    transport.destroy();
+  });
+
+  it('exposes separate capture and delivery states', () => {
+    const worker = { compress: vi.fn() };
+    const transport = new ReplayTransport(resolveReplayConfig({}, 'key', 'https://example.test'), worker as any);
+    transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
+    expect(transport.getStatus().captureState).toBe('recording');
+    expect(transport.getStatus().deliveryState).toBe('idle');
+    transport.stopRecordingWindow();
+    expect(transport.getStatus().captureState).toBe('suspended');
+    transport.destroy();
+  });
+
+  it('throttles flood status notifications while preserving aggregate drops', async () => {
+    const worker = { compress: vi.fn() };
+    const transport = new ReplayTransport(resolveReplayConfig({ maxBufferSize: 128, maxBufferEvents: 2 }, 'key', 'https://example.test'), worker as any);
+    const statuses: any[] = [];
+    transport.subscribeStatus((status) => statuses.push(status));
+    transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent({ type: 2, timestamp: Date.now() });
+    for (let index = 0; index < 1_000; index++) transport.addEvent({ type: 3, timestamp: Date.now(), data: { index } });
+    await Promise.resolve();
+    expect(statuses.length).toBeLessThan(30);
+    expect(transport.getStatus().droppedEvents).toBeGreaterThan(900);
+    transport.destroy();
+  });
+
+  it('keeps status subscriptions across manual restart', () => {
+    const integration = replayIntegration({ sessionSampleRate: 1 });
+    const client = {
+      getConfig: () => ({ apiKey: 'key', endpoint: 'https://example.test', enabled: true }),
+      getScope: () => ({ getUser: () => ({ id: '' }), subscribeBreadcrumb: () => () => {}, }),
+      captureException: (error: Error) => error.message,
+    };
+    integration.install(client);
+    const statuses: any[] = [];
+    integration.subscribeStatus((status) => statuses.push(status));
+    integration.stop();
+    integration.start();
+    expect(statuses.some((status) => status.captureState === 'recording')).toBe(true);
+    integration.teardown?.();
   });
 });
