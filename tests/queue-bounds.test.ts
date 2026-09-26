@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { record } from 'rrweb';
 import { RingBuffer } from '../src/buffer';
 import { resolveReplayConfig } from '../src/config';
+import { startRecording } from '../src/recorder';
 import { SessionManager } from '../src/session';
 import { ReplayTransport } from '../src/transport';
+
+vi.mock('rrweb', () => ({ record: vi.fn(() => vi.fn()) }));
 
 afterEach(() => {
   vi.useRealTimers();
@@ -156,6 +160,28 @@ describe('bounded replay queues', () => {
 
     transport.addEvent({ type: 2, timestamp: Date.now() + 2, data: { node: { type: 1, tagName: 'main' } } });
     transport.addEvent({ type: 3, timestamp: Date.now() + 3, data: { source: 2, type: 2 } });
+    await transport.flush();
+    expect(worker.compress).toHaveBeenCalledTimes(1);
+    transport.destroy();
+  });
+
+  it('blocks recorder mutations after privacy rejects a session baseline', async () => {
+    const worker = { compress: vi.fn(async (events: any[]) => ({ compressed: new Uint8Array([1]), originalSize: events.length })) };
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 202 })));
+    const config = resolveReplayConfig({}, 'recorder-baseline', 'https://example.test');
+    const transport = new ReplayTransport(config, worker as any);
+    transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    startRecording(config, (event) => transport.addEvent(event));
+    const emit = (record as any).mock.calls.at(-1)[0].emit;
+    emit({ type: 2, timestamp: Date.now(), data: { node: null } }, false);
+    emit({ type: 3, timestamp: Date.now() + 1, data: { source: 2, type: 2 } }, false);
+    await transport.flush();
+    expect(worker.compress).not.toHaveBeenCalled();
+    expect(transport.getStatus().acknowledgedChunks).toBe(0);
+
+    emit({ type: 2, timestamp: Date.now() + 2, data: { node: { type: 1, tagName: 'main' } } }, false);
+    emit({ type: 3, timestamp: Date.now() + 3, data: { source: 2, type: 2 } }, false);
     await transport.flush();
     expect(worker.compress).toHaveBeenCalledTimes(1);
     transport.destroy();
