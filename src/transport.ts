@@ -26,10 +26,11 @@ const MAX_ATTEMPTS = 3;
 const BEACON_SIZE_LIMIT = 65536;
 
 // A service name is only a lookup hint. The server makes the scope decision.
-function boundedServiceName(name: string | undefined): string {
-  const value = name?.trim() ?? '';
+function boundedServiceName(name: string | undefined): string | null {
+  if (name === undefined || name === '') return '';
+  const value = name.trim();
   if (!value || new TextEncoder().encode(value).byteLength > 255 || /[\u0000-\u001f\u007f]/.test(value)) {
-    return '';
+    return null;
   }
   return value;
 }
@@ -226,6 +227,9 @@ export class ReplayTransport {
         return; // No session -- discard events
       }
 
+      // An invalid configured claim must not become a legacy upload.
+      if (boundedServiceName(this.config.serviceName) === null) return;
+
       const headers = this.uploadHeaders(segmentId);
 
       // Compress via worker (or main-thread fallback)
@@ -266,6 +270,8 @@ export class ReplayTransport {
       if (!sessionId) {
         return;
       }
+
+      if (boundedServiceName(this.config.serviceName) === null) return;
 
       // Compress on main thread (sync -- sendBeacon requires sync data)
       const json = JSON.stringify(events);
