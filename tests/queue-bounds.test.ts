@@ -108,6 +108,27 @@ describe('bounded replay queues', () => {
     transport.destroy();
   });
 
+  it('never uploads a buffer-mode region without a snapshot', async () => {
+    const uploaded: any[][] = [];
+    let mode = 'buffer';
+    const worker = { compress: vi.fn(async (events: any[]) => {
+      uploaded.push(events);
+      return { compressed: new Uint8Array([1]), originalSize: 1 };
+    }) };
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 202 })));
+    const transport = new ReplayTransport(resolveReplayConfig({ maxBufferEvents: 2 }, 'buffer-only', 'https://example.test'), worker as any);
+    transport.start(() => 'session', () => 0, () => mode, () => '', () => '');
+    transport.stop();
+    const now = Date.now();
+    transport.addEvent({ type: 2, timestamp: now });
+    transport.addEvent({ type: 3, timestamp: now + 1 });
+    transport.addEvent({ type: 3, timestamp: now + 2 });
+    await transport.flush();
+    mode = 'session';
+    expect(uploaded).toHaveLength(0);
+    transport.destroy();
+  });
+
   it('stops an oversized baseline region until a fresh snapshot arrives', () => {
     const worker = { compress: vi.fn() };
     const transport = new ReplayTransport(resolveReplayConfig({ maxBufferSize: 128 }, 'key', 'https://example.test'), worker as any);
@@ -138,10 +159,11 @@ describe('bounded replay queues', () => {
   });
 
   it('keeps error mode stopped after repeated oversized baselines', () => {
-    const manager = new SessionManager(resolveReplayConfig({ sessionSampleRate: 0, errorSampleRate: 1, maxBufferSize: 128 }, 'key', 'https://example.test'));
+    const manager = new SessionManager(resolveReplayConfig({ sessionSampleRate: 0, errorSampleRate: 1, maxBufferSize: 128 }, 'oversized', 'https://example.test'));
     const captured: any[][] = [];
     manager.setEventCallback((events) => { captured.push(events); });
     manager.setRestartCallback(() => {});
+    expect(manager.getMode()).toBe('buffer');
     const now = Date.now();
     manager.onEvent({ type: 2, timestamp: now, data: { text: 'x'.repeat(1_000) } }, true);
     manager.onError();
@@ -169,8 +191,10 @@ describe('bounded replay queues', () => {
   });
 
   it('keeps bounds isolated across concurrent sessions', () => {
-    const small = new SessionManager(resolveReplayConfig({ sessionSampleRate: 0, errorSampleRate: 1, maxBufferEvents: 2 }, 'small', 'https://example.test'));
-    const large = new SessionManager(resolveReplayConfig({ sessionSampleRate: 0, errorSampleRate: 1, maxBufferEvents: 100 }, 'large', 'https://example.test'));
+    const smallConfig = resolveReplayConfig({ sessionSampleRate: 0, errorSampleRate: 1, maxBufferEvents: 2 }, 'small', 'https://example.test');
+    const largeConfig = resolveReplayConfig({ sessionSampleRate: 0, errorSampleRate: 1, maxBufferEvents: 100 }, 'large', 'https://example.test');
+    const small = new SessionManager(smallConfig);
+    const large = new SessionManager(largeConfig);
     const smallCaptured: any[][] = [];
     const largeCaptured: any[][] = [];
     small.setEventCallback((events) => { smallCaptured.push(events); });
