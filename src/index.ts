@@ -120,20 +120,20 @@ export function replayIntegration(
         // in OTLP output -- extras would prefix it as "extra.replay_id".
         const originalCaptureException = client.captureException;
         if (typeof originalCaptureException === 'function') {
-          const previousReplayTag = (() => {
-            try {
-              const tags = client.getScope()?.getTags?.() ?? {};
-              return {
-                present: Object.prototype.hasOwnProperty.call(tags, 'replay_id'),
-                value: typeof tags.replay_id === 'string' ? tags.replay_id : '',
-              };
-            } catch {
-              return { present: false, value: '' };
-            }
-          })();
           const wrappedCaptureException = function (this: unknown, error: Error, context?: any): string {
             const replayId = session?.getSessionId() ?? '';
             const captureScope = client.getScope();
+            const previousReplayTag = replayId ? (() => {
+              try {
+                const tags = captureScope?.getTags?.() ?? {};
+                return {
+                  present: Object.prototype.hasOwnProperty.call(tags, 'replay_id'),
+                  value: typeof tags.replay_id === 'string' ? tags.replay_id : '',
+                };
+              } catch {
+                return { present: false, value: '' };
+              }
+            })() : { present: false, value: '' };
             try {
               if (replayId) captureScope.setTag('replay_id', replayId);
               return originalCaptureException.call(this, error, context);

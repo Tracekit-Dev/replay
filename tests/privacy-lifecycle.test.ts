@@ -199,6 +199,32 @@ describe('Replay privacy lifecycle', () => {
     replay.teardown();
   });
 
+  it('restores the replay tag that exists immediately before capture', () => {
+    vi.stubGlobal('document', document);
+    vi.stubGlobal('sessionStorage', storageMap());
+    const originalCaptureException = vi.fn(() => 'event-id');
+    let replayTag = 'installation-replay-id';
+    const scope = {
+      getUser: () => null,
+      getTags: () => ({ replay_id: replayTag }),
+      subscribeBreadcrumb: vi.fn(() => vi.fn()),
+      setTag: vi.fn(),
+    };
+    const client = {
+      getConfig: () => ({ enabled: true, apiKey: 'key', endpoint: 'http://localhost', serviceName: 'checkout' }),
+      getScope: () => scope,
+      captureException: originalCaptureException,
+    };
+    const replay = replayIntegration({ sessionSampleRate: 1 });
+
+    replay.install(client);
+    replayTag = 'call-time-replay-id';
+    client.captureException(new Error('test'));
+
+    expect(scope.setTag).toHaveBeenLastCalledWith('replay_id', 'call-time-replay-id');
+    replay.teardown();
+  });
+
   it('reinitializes one addon instance with one stopped old recorder and one new recorder', () => {
     vi.stubGlobal('document', document);
     vi.stubGlobal('sessionStorage', storageMap());
