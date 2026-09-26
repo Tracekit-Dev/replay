@@ -14,6 +14,8 @@ describe('privacy sanitizer', () => {
     ['missing data', undefined],
     ['empty data', {}],
     ['malformed data', { node: { type: 2, id: 9, tagName: 'div>', attributes: {}, childNodes: [] } }],
+    ['text root', { node: { type: 3, id: 9, textContent: 'safe' }, initialOffset: { top: 0, left: 0 } }],
+    ['element root', { node: { type: 2, id: 9, tagName: 'div', attributes: {}, childNodes: [] }, initialOffset: { top: 0, left: 0 } }],
   ])('keeps failed ancestry closed after a type 2 marker with %s', (_name, markerData) => {
     const sanitizer = new ReplayPrivacySanitizer(config());
     const valid = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
