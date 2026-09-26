@@ -72,6 +72,8 @@ export class ReplayTransport {
   private dropBaselineTotal = 0;
   private needsSnapshot = false;
   private snapshotRequested = false;
+  private hasCadenceSnapshot = false;
+  private detachedChunksSinceSnapshot = 0;
   private requestSnapshot: (() => void) | null = null;
   private failureCallback: (() => void) | null = null;
   private recordingWindowStart: number | null = null;
@@ -146,6 +148,10 @@ export class ReplayTransport {
     }
     this.reportingSessionId = sessionId;
     this.dropBaselineTotal = this.status.droppedEvents;
+    this.hasCadenceSnapshot = false;
+    this.detachedChunksSinceSnapshot = 0;
+    this.needsSnapshot = false;
+    this.snapshotRequested = false;
     this.clickCount = 0;
     this.keypressCount = 0;
   }
@@ -399,6 +405,8 @@ export class ReplayTransport {
       if (isFullSnapshot(event)) {
         this.needsSnapshot = false;
         this.snapshotRequested = false;
+        this.hasCadenceSnapshot = true;
+        this.detachedChunksSinceSnapshot = 0;
       }
       // An error buffer begins at its oldest retained event, not recorder start.
       if (this.pendingEvents.length === 0 && this.replayTypeFn?.() === 'buffer' &&
@@ -438,6 +446,15 @@ export class ReplayTransport {
   // Flush (async -- normal upload path)
   // ---------------------------------------------------------------------------
 
+  /** Request a real rrweb checkout before a fourth dependent chunk can begin. */
+  private noteDetachedChunk(final: boolean): void {
+    if (final || !this.hasCadenceSnapshot || this.needsSnapshot) return;
+    this.detachedChunksSinceSnapshot++;
+    if (this.detachedChunksSinceSnapshot < 3) return;
+    this.needsSnapshot = true;
+    this.requestFreshSnapshot();
+  }
+
   /**
    * Flush pending events: compress via worker and upload via fetch with retry.
    * Returns silently if no events are pending.
@@ -466,6 +483,7 @@ export class ReplayTransport {
     let finish!: () => void;
     const job = new Promise<void>((resolve) => { finish = resolve; });
     this.activeFlush = job;
+    this.noteDetachedChunk(final);
     void (async () => {
     try {
       const sessionId = this.sessionIdFn ? this.sessionIdFn() : '';
@@ -653,6 +671,7 @@ export class ReplayTransport {
       this.pendingTimes = [];
       this.bufferSize = 0;
       if (events.length === 0) return;
+      this.noteDetachedChunk(final);
 
       const sessionId = this.sessionIdFn ? this.sessionIdFn() : '';
       this.setSessionIdentity(sessionId);
