@@ -136,4 +136,55 @@ describe('bounded replay queues', () => {
     expect(captured.reduce((total, event) => total + new TextEncoder().encode(JSON.stringify(event)).byteLength, 0)).toBeLessThanOrEqual(128);
     manager.destroy();
   });
+
+  it('keeps error mode stopped after repeated oversized baselines', () => {
+    const manager = new SessionManager(resolveReplayConfig({ sessionSampleRate: 0, errorSampleRate: 1, maxBufferSize: 128 }, 'key', 'https://example.test'));
+    const captured: any[][] = [];
+    manager.setEventCallback((events) => { captured.push(events); });
+    manager.setRestartCallback(() => {});
+    const now = Date.now();
+    manager.onEvent({ type: 2, timestamp: now, data: { text: 'x'.repeat(1_000) } }, true);
+    manager.onError();
+    manager.onEvent({ type: 2, timestamp: now + 1, data: { text: 'y'.repeat(1_000) } }, true);
+    manager.onError();
+    manager.onEvent({ type: 3, timestamp: now + 2, data: { text: 'orphan' } }, false);
+    manager.onError();
+    expect(manager.getMode()).toBe('buffer');
+    expect(captured).toHaveLength(0);
+    manager.destroy();
+  });
+
+  it('keeps error-mode age limits per session', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const manager = new SessionManager(resolveReplayConfig({ sessionSampleRate: 0, errorSampleRate: 1, maxBufferAgeMs: 10 }, 'key', 'https://example.test'));
+    const captured: any[][] = [];
+    manager.setEventCallback((events) => { captured.push(events); });
+    manager.onEvent({ type: 2, timestamp: 0 }, true);
+    vi.advanceTimersByTime(100);
+    manager.onError();
+    expect(captured).toHaveLength(0);
+    manager.destroy();
+    vi.useRealTimers();
+  });
+
+  it('keeps bounds isolated across concurrent sessions', () => {
+    const small = new SessionManager(resolveReplayConfig({ sessionSampleRate: 0, errorSampleRate: 1, maxBufferEvents: 2 }, 'small', 'https://example.test'));
+    const large = new SessionManager(resolveReplayConfig({ sessionSampleRate: 0, errorSampleRate: 1, maxBufferEvents: 100 }, 'large', 'https://example.test'));
+    const smallCaptured: any[][] = [];
+    const largeCaptured: any[][] = [];
+    small.setEventCallback((events) => { smallCaptured.push(events); });
+    large.setEventCallback((events) => { largeCaptured.push(events); });
+    const now = Date.now();
+    for (const manager of [small, large]) {
+      manager.onEvent({ type: 2, timestamp: now }, true);
+      manager.onEvent({ type: 3, timestamp: now + 1 }, false);
+      manager.onEvent({ type: 3, timestamp: now + 2 }, false);
+      manager.onError();
+    }
+    expect(smallCaptured[0]?.length).toBeLessThanOrEqual(2);
+    expect(largeCaptured[0]?.length).toBe(3);
+    small.destroy();
+    large.destroy();
+  });
 });
