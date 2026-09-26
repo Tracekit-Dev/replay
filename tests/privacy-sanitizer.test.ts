@@ -381,4 +381,102 @@ describe('Replay privacy sanitizer', () => {
     expect(documentNode.childNodes[1]).toMatchObject({ name: 'html', publicId: '', systemId: '' });
     for (const variant of variants) expect(sanitizeReplayEvent(variant)).not.toBeNull();
   });
+
+  it('emits every serialized node type and core delay with exact safe shapes', () => {
+    const safe = sanitizeReplayEvent({
+      type: 2,
+      timestamp: 10,
+      delay: 25,
+      data: {
+        node: {
+          type: 0,
+          id: 1,
+          compatMode: 'CSS1Compat',
+          rootId: 9,
+          isShadowHost: true,
+          isShadow: true,
+          childNodes: [
+            { type: 1, id: 2, name: 'html', publicId: '', systemId: '' },
+            {
+              type: 2,
+              id: 3,
+              tagName: 'div',
+              attributes: { class: 'safe', removed: null },
+              childNodes: [],
+              isSVG: true,
+              needBlock: true,
+              isCustom: true,
+            },
+            { type: 3, id: 4, textContent: 'text', isStyle: true },
+            { type: 4, id: 5, textContent: 'cdata' },
+            { type: 5, id: 6, textContent: 'comment' },
+          ],
+        },
+        initialOffset: { top: 1, left: 2 },
+      },
+    });
+
+    expect(safe).toEqual({
+      type: 2,
+      timestamp: 10,
+      delay: 25,
+      data: {
+        node: {
+          type: 0,
+          id: 1,
+          rootId: 9,
+          isShadowHost: true,
+          isShadow: true,
+          compatMode: 'CSS1Compat',
+          childNodes: [
+            { type: 1, id: 2, name: 'html', publicId: '', systemId: '' },
+            {
+              type: 2,
+              id: 3,
+              tagName: 'div',
+              attributes: { class: '****', removed: null },
+              childNodes: [],
+              isSVG: true,
+              needBlock: true,
+              isCustom: true,
+            },
+            { type: 3, id: 4, textContent: '****', isStyle: true },
+            { type: 4, id: 5, textContent: '*****' },
+            { type: 5, id: 6, textContent: '*******' },
+          ],
+        },
+        initialOffset: { top: 1, left: 2 },
+      },
+    });
+  });
+
+  it('emits every installed rrweb incremental source with exact safe shapes', () => {
+    const variants = [
+      [{ source: 0, texts: [{ id: 1, value: null }], attributes: [], removes: [], adds: [] }, { source: 0, texts: [{ id: 1, value: null }], attributes: [], removes: [], adds: [] }],
+      [{ source: 1, positions: [{ x: 1, y: 2, id: 3, timeOffset: 4 }] }, { source: 1, positions: [{ x: 1, y: 2, id: 3, timeOffset: 4 }] }],
+      [{ source: 2, type: 2, id: 3, x: 1, y: 2, pointerType: 0 }, { source: 2, type: 2, id: 3, x: 1, y: 2, pointerType: 0 }],
+      [{ source: 3, id: 3, x: 1, y: 2 }, { source: 3, id: 3, x: 1, y: 2 }],
+      [{ source: 4, width: 100, height: 200 }, { source: 4, width: 100, height: 200 }],
+      [{ source: 5, id: 3, text: 'value', isChecked: false, userTriggered: true }, { source: 5, id: 3, text: '*****', isChecked: false, userTriggered: true }],
+      [{ source: 6, positions: [{ x: 1, y: 2, id: 3, timeOffset: 4 }] }, { source: 6, positions: [{ x: 1, y: 2, id: 3, timeOffset: 4 }] }],
+      [{ source: 7, type: 0, id: 3, currentTime: 1, volume: 2, muted: true, loop: false, playbackRate: 3 }, { source: 7, type: 0, id: 3, currentTime: 1, volume: 2, muted: true, loop: false, playbackRate: 3 }],
+      [{ source: 8, id: 3, styleId: 4, removes: [{ index: 1 }], adds: [{ rule: 'body{}', index: 0 }], replace: 'body{}', replaceSync: 'body{}' }, { source: 8, id: 3, styleId: 4, removes: [{ index: 1 }], adds: [{ rule: 'body{}', index: 0 }], replace: 'body{}', replaceSync: 'body{}' }],
+      [{ source: 9, id: 3, type: 0, commands: [{ property: 'fillStyle', args: ['red'], setter: true }] }, { source: 9, id: 3, type: 0, commands: [{ property: 'fillStyle', args: ['red'], setter: true }] }],
+      [{ source: 10, family: 'sans', fontSource: 'font', buffer: false, descriptors: { style: 'normal' } }, { source: 10, family: 'sans', fontSource: 'font', buffer: false, descriptors: { style: 'normal' } }],
+      [{ source: 11, level: 'info', payload: 'message' }, { source: 11, level: 'info', payload: 'message' }],
+      [{ source: 12, positions: [{ x: 1, y: 2, id: 3, timeOffset: 4 }] }, { source: 12, positions: [{ x: 1, y: 2, id: 3, timeOffset: 4 }] }],
+      [{ source: 13, id: 3, styleId: 4, index: [0], set: { property: 'color', value: null, priority: undefined }, remove: { property: 'background' } }, { source: 13, id: 3, styleId: 4, index: [0], set: { property: 'color', value: null }, remove: { property: 'background' } }],
+      [{ source: 14, ranges: [{ start: 1, startOffset: 2, end: 3, endOffset: 4 }] }, { source: 14, ranges: [{ start: 1, startOffset: 2, end: 3, endOffset: 4 }] }],
+      [{ source: 15, id: 3, styleIds: [4], styles: [{ styleId: 4, rules: [{ rule: 'body{}', index: 0 }] }] }, { source: 15, id: 3, styleIds: [4], styles: [{ styleId: 4, rules: [{ rule: 'body{}', index: 0 }] }] }],
+      [{ source: 16, define: { name: 'custom-element' } }, { source: 16, define: { name: 'custom-element' } }],
+    ] as const;
+
+    for (const [input, expectedData] of variants) {
+      expect(sanitizeReplayEvent({ type: 3, timestamp: 1, data: input })).toEqual({
+        type: 3,
+        timestamp: 1,
+        data: expectedData,
+      });
+    }
+  });
 });

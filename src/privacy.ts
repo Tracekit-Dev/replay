@@ -251,7 +251,7 @@ function sanitizeNode(node: unknown, context: NodeContext, depth: number, opts: 
   copyNodeStructural(output, source, type);
 
   if (type === 3 || type === 4 || type === 5) {
-    const key = type === 3 || type === 4 ? 'textContent' : 'text';
+    const key = 'textContent';
     const value = typeof source[key] === 'string' ? source[key] as string : '';
     output[key] = sanitizeNodeText(value, context);
     return output;
@@ -303,9 +303,13 @@ function sanitizeValue(
   for (const childKey of Object.keys(value as Record<string, unknown>).slice(0, MAX_KEYS)) {
     const outputKey = sanitizeObjectKey(childKey);
     if (outputKey === null) continue;
-    const childValue = (value as Record<string, unknown>)[childKey];
-    if (typeof childValue === 'function') continue;
-    const safeValue = sanitizeValue(childValue, childKey, depth + 1, opts, mode);
+      const childValue = (value as Record<string, unknown>)[childKey];
+      if (typeof childValue === 'function') continue;
+      if (childValue === null) {
+        output[outputKey] = null;
+        continue;
+      }
+      const safeValue = sanitizeValue(childValue, childKey, depth + 1, opts, mode);
     if (safeValue !== null) output[outputKey] = safeValue;
   }
   return output;
@@ -330,6 +334,7 @@ function sanitizeMutation(data: Record<string, unknown>, opts: ResolvedPrivacyOp
       const id = safeNumber(source.id);
       if (id !== null) item.id = id;
       if (typeof source.value === 'string') item.value = mask(source.value);
+      else if (source.value === null) item.value = null;
       texts.push(item);
     }
     output.texts = texts;
@@ -435,6 +440,8 @@ function sanitizeReplayEventUnsafe(value: unknown, privacyOptions?: PrivacyOptio
   const output: Record<string, unknown> = { type };
   const timestamp = safeNumber(source.timestamp);
   if (timestamp !== null) output.timestamp = timestamp;
+  const delay = safeNumber(source.delay);
+  if (delay !== null) output.delay = delay;
   const opts = options(privacyOptions);
   if (source.data === undefined) {
     output.data = {};
