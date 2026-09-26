@@ -10,14 +10,14 @@ vi.mock('rrweb', () => ({ record: recordMock }));
 const config = () => resolveReplayConfig({ unmask: ['.public'], block: ['.secret'] }, 'test-key', 'https://api.test');
 
 describe('privacy sanitizer', () => {
-  it('rejects a remove with an existing but inconsistent parent and stays failed until FullSnapshot', () => {
+  it.each([['inconsistent', 4], ['missing', 99]])('rejects a remove with an %s parent and stays failed until FullSnapshot', (_name, forgedParentId) => {
     const sanitizer = new ReplayPrivacySanitizer(resolveReplayConfig({ unmask: ['.public'] }, 'test-key', 'https://api.test'));
     const snapshot = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
       { type: 2, id: 2, tagName: 'div', attributes: {}, childNodes: [{ type: 3, id: 3, textContent: 'safe' }] },
       { type: 2, id: 4, tagName: 'div', attributes: { class: 'public' }, childNodes: [] },
     ] } } };
     expect(sanitizer.sanitize(snapshot)).not.toBeNull();
-    const forged = { type: 3, timestamp: 2, data: { source: 0, adds: [], texts: [], attributes: [], removes: [{ parentId: 4, id: 2 }] } };
+    const forged = { type: 3, timestamp: 2, data: { source: 0, adds: [], texts: [], attributes: [], removes: [{ parentId: forgedParentId, id: 2 }] } };
     expect(sanitizer.sanitize(forged)).toBeNull();
     const reuse = { type: 3, timestamp: 3, data: { source: 0, adds: [{ parentId: 4, node: { type: 2, id: 2, tagName: 'div', attributes: {}, childNodes: [{ type: 3, id: 5, textContent: 'synthetic-secret-canary' }] } }], texts: [], attributes: [], removes: [] } };
     expect(sanitizer.sanitize(reuse)).toBeNull();
