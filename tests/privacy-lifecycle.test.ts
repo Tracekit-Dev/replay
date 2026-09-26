@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { record } from 'rrweb';
 import { replayIntegration } from '../src/index';
 import { SessionManager } from '../src/session';
 import type { ResolvedReplayConfig } from '../src/types';
+
+vi.mock('rrweb', () => ({ record: vi.fn(() => vi.fn()) }));
 
 class FakeDocument {
   visibilityState: 'visible' | 'hidden' = 'visible';
@@ -120,5 +123,41 @@ describe('Replay privacy lifecycle', () => {
     expect(worker).not.toHaveBeenCalled();
     expect(storage.values).toHaveLength(0);
     expect(scope.subscribeBreadcrumb).not.toHaveBeenCalled();
+  });
+
+  it('keeps one recorder per active lifecycle and restores the host wrapper', () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('document', document);
+    vi.stubGlobal('sessionStorage', storageMap());
+    const originalCaptureException = vi.fn(() => 'event-id');
+    const scope = {
+      getUser: () => null,
+      subscribeBreadcrumb: vi.fn(() => vi.fn()),
+      setTag: vi.fn(),
+    };
+    const client = {
+      getConfig: () => ({ enabled: true, apiKey: 'key', endpoint: 'http://localhost', serviceName: 'checkout' }),
+      getScope: () => scope,
+      captureException: originalCaptureException,
+    };
+    const replay = replayIntegration({ sessionSampleRate: 1, idleTimeout: 10_000, flushInterval: 10_000 });
+
+    replay.install(client);
+    const firstId = replay.getSessionId();
+    expect(record).toHaveBeenCalledTimes(1);
+    const wrappedCaptureException = client.captureException;
+
+    replay.stop();
+    document.dispatch('pointerdown', new Event('pointerdown'));
+    expect(replay.getSessionId()).toBe('');
+    expect(record).toHaveBeenCalledTimes(1);
+
+    replay.start();
+    expect(replay.getSessionId()).not.toBe(firstId);
+    expect(record).toHaveBeenCalledTimes(2);
+    expect(client.captureException).toBe(wrappedCaptureException);
+
+    replay.teardown();
+    expect(client.captureException).toBe(originalCaptureException);
   });
 });
