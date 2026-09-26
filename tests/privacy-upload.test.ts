@@ -14,6 +14,14 @@ const decode = (bytes: Uint8Array) => new TextDecoder().decode(gunzipSync(bytes)
 const canary = 'synthetic-secret-canary';
 const secretEvent = { type: 5, timestamp: 100, data: { tag: 'console-log', payload: { level: 'error', message: canary, data: { nested: { secret: canary } }, stack: canary } } };
 const urlEvent = { type: 4, timestamp: 101, data: { href: `https://user:${canary}@site.test/path?token=${canary}#${canary}`, width: 100, height: 100 } };
+const collisionSnapshot = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+  { type: 2, id: 2, tagName: 'div', attributes: {}, childNodes: [{ type: 3, id: 3, textContent: 'safe' }] },
+] } } };
+function collisionMutation(id: number) {
+  return { type: 3, timestamp: 2, data: { source: 0, adds: [{ parentId: 2, nextId: null, node: {
+    type: 2, id, tagName: 'div', attributes: { class: 'public' }, childNodes: [{ type: 3, id: 4, textContent: canary }],
+  } }], texts: [], attributes: [], removes: [] } };
+}
 
 function transport(replayConfig: Parameters<typeof resolveReplayConfig>[0] = {}) {
   const config = resolveReplayConfig(replayConfig, 'test-key', 'https://api.test');
@@ -31,6 +39,44 @@ function transport(replayConfig: Parameters<typeof resolveReplayConfig>[0] = {})
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('serialized privacy upload paths', () => {
+  it.each([['self', 2], ['ancestor', 1], ['descendant', 3]])('keeps %s ID collision canaries out of fetch and retry bytes', async (_name, id) => {
+    vi.useFakeTimers();
+    const calls: RequestInit[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      calls.push(init);
+      return { ok: calls.length === 2, status: calls.length === 2 ? 200 : 500 };
+    }));
+    const instance = transport({ unmask: ['.public'] });
+    instance.addEvent(collisionSnapshot);
+    instance.addEvent(collisionMutation(id));
+    instance.addEvent({ ...collisionSnapshot, timestamp: 3 });
+    instance.addEvent(urlEvent);
+    const pending = instance.flush();
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(calls).toHaveLength(2);
+    for (const call of calls) expect(decode(call.body as Uint8Array)).not.toContain(canary);
+    instance.destroy();
+    vi.useRealTimers();
+  });
+
+  it.each([['self', 2], ['ancestor', 1], ['descendant', 3]])('keeps %s ID collision canaries out of beacon and keepalive bytes', async (_name, id) => {
+    const beacon = vi.fn(() => false);
+    const fetchMock = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal('navigator', { sendBeacon: beacon });
+    vi.stubGlobal('fetch', fetchMock);
+    const instance = transport({ unmask: ['.public'] });
+    instance.addEvent(collisionSnapshot);
+    instance.addEvent(collisionMutation(id));
+    instance.addEvent({ ...collisionSnapshot, timestamp: 3 });
+    instance.addEvent(urlEvent);
+    instance.flushSync();
+    expect(beacon).toHaveBeenCalledTimes(1);
+    expect(decode(new Uint8Array(await beacon.mock.calls[0][1].arrayBuffer()))).not.toContain(canary);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(decode(new Uint8Array(await fetchMock.mock.calls[0][1].body.arrayBuffer()))).not.toContain(canary);
+    instance.destroy();
+  });
   it('drops malformed snapshot and mutation canaries from fetch and retry bytes', async () => {
     vi.stubGlobal('document', { querySelector: () => null, createElement: () => { throw new Error('InvalidCharacterError'); } });
     vi.useFakeTimers();

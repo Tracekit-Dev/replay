@@ -10,6 +10,48 @@ vi.mock('rrweb', () => ({ record: recordMock }));
 const config = () => resolveReplayConfig({ unmask: ['.public'], block: ['.secret'] }, 'test-key', 'https://api.test');
 
 describe('privacy sanitizer', () => {
+  it.each([['self', 2], ['ancestor', 1], ['descendant', 3]])('rejects %s rrweb ID collisions and closes ancestry', (_name, collisionId) => {
+    const sanitizer = new ReplayPrivacySanitizer(resolveReplayConfig({ unmask: ['.public'] }, 'test-key', 'https://api.test'));
+    const snapshot = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+      { type: 2, id: 2, tagName: 'div', attributes: {}, childNodes: [{ type: 3, id: 3, textContent: 'safe' }] },
+    ] } } };
+    expect(sanitizer.sanitize(snapshot)).not.toBeNull();
+    const collision = { type: 3, timestamp: 2, data: { source: 0, adds: [{ parentId: 2, nextId: null,
+      node: { type: 2, id: collisionId, tagName: 'div', attributes: { class: 'public' }, childNodes: [
+        { type: 3, id: 4, textContent: 'synthetic-secret-canary' },
+      ] },
+    }], texts: [], attributes: [], removes: [] } };
+    expect(sanitizer.sanitize(collision)).toBeNull();
+    expect(sanitizer.sanitize({ type: 3, timestamp: 3, data: { source: 0, adds: [], texts: [{ id: 4, value: 'synthetic-secret-canary' }], attributes: [], removes: [] } })).toBeNull();
+    expect(sanitizer.sanitize({ ...snapshot, timestamp: 4 })).not.toBeNull();
+  });
+
+  it('retains safe top-level layout beside unsupported nested CSS in an actual rrweb rebuild', async () => {
+    const page = new Window({ url: 'https://fixture.test/' });
+    vi.stubGlobal('window', page);
+    vi.stubGlobal('document', page.document);
+    vi.stubGlobal('location', page.location);
+    for (const name of Object.getOwnPropertyNames(page)) {
+      if (/^(HTML|SVG|CSS|Node$|Element$|Document$|ShadowRoot$)/.test(name) && typeof (page as any)[name] === 'function') vi.stubGlobal(name, (page as any)[name]);
+    }
+    try {
+      const { snapshot, rebuild, createMirror } = await import('rrweb-snapshot');
+      page.document.body.innerHTML = `<style>.panel{display:grid;width:500px}@media (max-width:600px){.panel{display:block;content:'synthetic-secret-canary';background-image:url(https://cdn.test/?token=synthetic-secret-canary)}}.button{position:absolute;left:12px}</style><div class="panel"><button class="button">safe</button></div>`;
+      const captured = snapshot(page.document, { inlineStylesheet: true, maskTextSelector: '*', maskAllInputs: true });
+      expect(JSON.stringify(captured)).toContain('@media');
+      const safe = new ReplayPrivacySanitizer(config()).sanitize({ type: 2, timestamp: 1, data: { node: captured, initialOffset: { top: 0, left: 0 } } });
+      expect(safe).not.toBeNull();
+      expect(JSON.stringify(safe)).not.toContain('synthetic-secret-canary');
+      expect(JSON.stringify(safe)).not.toContain('background-image');
+      const rebuilt = new page.Document();
+      rebuild(JSON.parse(JSON.stringify(safe.data.node)), { doc: rebuilt, mirror: createMirror() });
+      const panel = rebuilt.querySelector('div.panel, div[class]')!;
+      const button = rebuilt.querySelector('button')!;
+      expect(page.getComputedStyle(panel).display).toBe('grid');
+      expect(page.getComputedStyle(panel).width).toBe('500px');
+      expect(page.getComputedStyle(button).position).toBe('absolute');
+    } finally { vi.unstubAllGlobals(); await page.happyDOM.abort(); }
+  });
   it('rebuilds an actual rrweb snapshot with stable safe selectors and layout', async () => {
     const page = new Window({ url: 'https://fixture.test/page?token=synthetic-secret-canary' });
     vi.stubGlobal('window', page);
