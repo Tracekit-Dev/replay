@@ -42,6 +42,24 @@ export interface ReplayConfig {
   /** Max buffer size in bytes (default: 24117248 = 23MB) */
   maxBufferSize?: number;
 
+  /** Maximum events retained before the transport drops old regions. */
+  maxBufferEvents?: number;
+
+  /** Maximum age of retained events in milliseconds. */
+  maxBufferAgeMs?: number;
+
+  /** Maximum events in one compressed chunk. */
+  maxChunkEvents?: number;
+
+  /** Maximum compressed chunk size in bytes. */
+  maxChunkBytes?: number;
+
+  /** Maximum time allowed for one fetch request. */
+  fetchTimeoutMs?: number;
+
+  /** Maximum age of one retry sequence. */
+  retryMaxAgeMs?: number;
+
   /**
    * Inline images as base64 data URIs in the recording.
    * When true, images are captured and available during replay.
@@ -72,6 +90,12 @@ export interface ResolvedReplayConfig {
   idleTimeout: number;
   flushInterval: number;
   maxBufferSize: number;
+  maxBufferEvents: number;
+  maxBufferAgeMs: number;
+  maxChunkEvents: number;
+  maxChunkBytes: number;
+  fetchTimeoutMs: number;
+  retryMaxAgeMs: number;
   inlineImages: boolean;
   blockMedia: boolean;
   /** Stable service discriminator used for replay storage namespacing. */
@@ -123,3 +147,22 @@ export interface ReplayChunk {
   compressed: Uint8Array;
   originalSize: number;
 }
+
+export type ReplayDeliveryState = 'idle' | 'recording' | 'stopped';
+
+/** Safe delivery facts for diagnostics. This type never contains replay data. */
+export interface ReplayStatus {
+  state: ReplayDeliveryState;
+  pendingBytes: number;
+  pendingEvents: number;
+  pendingChunks: number;
+  inflightPayloads: number;
+  inflightFetches: number;
+  acknowledgedChunks: number;
+  droppedChunks: number;
+  droppedEvents: number;
+  unknownChunks: number;
+  lastReason: string | null;
+}
+
+export type ReplayStatusListener = (status: ReplayStatus) => void;

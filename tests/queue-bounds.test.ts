@@ -69,4 +69,20 @@ describe('bounded replay queues', () => {
     expect(JSON.stringify(status)).not.toContain('😀');
     transport.destroy();
   });
+
+  it('keeps a flood bounded while preserving a terminal drop count', () => {
+    const worker = { compress: vi.fn(async (events: any[]) => ({ compressed: new Uint8Array([1]), originalSize: events.length })) };
+    const transport = new ReplayTransport(resolveReplayConfig({ maxBufferSize: 512, maxBufferEvents: 8 }, 'key', 'https://example.test'), worker as any);
+    transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent({ type: 2, timestamp: Date.now() });
+    for (let index = 0; index < 1_000; index++) {
+      transport.addEvent({ type: 3, timestamp: Date.now(), data: { index, text: 'flood' } });
+    }
+    const status = transport.getStatus();
+    expect(status.pendingEvents).toBeLessThanOrEqual(8);
+    expect(status.pendingBytes).toBeLessThanOrEqual(512);
+    expect(status.droppedEvents).toBeGreaterThan(0);
+    transport.destroy();
+  });
 });

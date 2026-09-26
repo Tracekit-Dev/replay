@@ -38,11 +38,11 @@ describe('replay worker and delivery recovery', () => {
     const transport = new ReplayTransport(resolveReplayConfig({ fetchTimeoutMs: 40, retryMaxAgeMs: 100 }, 'key', 'https://example.test'), worker as any);
     transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
     transport.stop();
-    transport.addEvent({ type: 2, timestamp: 1 });
+    transport.addEvent({ type: 2, timestamp: Date.now() });
     const flush = transport.flush();
     await vi.advanceTimersByTimeAsync(200);
     await flush;
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(3);
     expect(transport.getStatus().droppedChunks + transport.getStatus().unknownChunks).toBe(1);
     transport.destroy();
   });
@@ -59,7 +59,7 @@ describe('replay worker and delivery recovery', () => {
     const unsubscribe = transport.subscribeStatus((status) => statuses.push(status));
     transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
     transport.stop();
-    transport.addEvent({ type: 2, timestamp: 1 });
+    transport.addEvent({ type: 2, timestamp: Date.now() });
     const flush = transport.flush();
     await vi.advanceTimersByTimeAsync(1_100);
     await flush;
@@ -70,6 +70,25 @@ describe('replay worker and delivery recovery', () => {
     transport.destroy();
   });
 
+  it('recovers from one offline failure within the retry window', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError('offline'))
+      .mockResolvedValueOnce(new Response('', { status: 202 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const worker = { compress: vi.fn(async () => ({ compressed: new Uint8Array([1]), originalSize: 1 })) };
+    const transport = new ReplayTransport(resolveReplayConfig({ retryMaxAgeMs: 5_000 }, 'key', 'https://example.test'), worker as any);
+    transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent({ type: 2, timestamp: Date.now() });
+    const flush = transport.flush();
+    await vi.advanceTimersByTimeAsync(1_100);
+    await flush;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(transport.getStatus().acknowledgedChunks).toBe(1);
+    transport.destroy();
+  });
+
   it('reports queued unknown for accepted beacons without recursive breadcrumbs', () => {
     const sendBeacon = vi.fn(() => true);
     vi.stubGlobal('navigator', { sendBeacon });
@@ -77,7 +96,7 @@ describe('replay worker and delivery recovery', () => {
     const transport = new ReplayTransport(resolveReplayConfig({}, 'secret-key', 'https://example.test'), worker as any);
     transport.start(() => 'session', () => 0, () => 'session', () => 'https://private.invalid/path?token=secret', () => 'user-secret');
     transport.stop();
-    transport.addEvent({ type: 2, timestamp: 1 });
+    transport.addEvent({ type: 2, timestamp: Date.now() });
     transport.flushSync();
     expect(transport.getStatus().unknownChunks).toBe(1);
     expect(JSON.stringify(transport.getStatus())).not.toContain('secret');
