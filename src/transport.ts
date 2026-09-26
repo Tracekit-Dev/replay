@@ -30,6 +30,10 @@ function serializedSize(value: unknown): number {
 }
 
 function isFullSnapshot(event: any): boolean { return event?.type === 2; }
+function isActualFullSnapshot(event: any): boolean {
+  return event?.type === 2 && event?.data?.node?.type === 0 &&
+    Number.isSafeInteger(event.data.node.id) && Array.isArray(event.data.node.childNodes);
+}
 function isDOMMutation(event: any): boolean { return event?.type === 3 && event?.data?.source === 0; }
 
 interface FrozenTerminal {
@@ -73,6 +77,7 @@ export class ReplayTransport {
   private needsSnapshot = false;
   private snapshotRequested = false;
   private hasCadenceSnapshot = false;
+  private awaitingCadenceSnapshot = false;
   private detachedChunksSinceSnapshot = 0;
   private requestSnapshot: (() => void) | null = null;
   private failureCallback: (() => void) | null = null;
@@ -149,6 +154,7 @@ export class ReplayTransport {
     this.reportingSessionId = sessionId;
     this.dropBaselineTotal = this.status.droppedEvents;
     this.hasCadenceSnapshot = false;
+    this.awaitingCadenceSnapshot = false;
     this.detachedChunksSinceSnapshot = 0;
     this.needsSnapshot = false;
     this.snapshotRequested = false;
@@ -402,11 +408,16 @@ export class ReplayTransport {
       this.publishStatus();
       return;
     }
-      if (isFullSnapshot(event)) {
+      if (isActualFullSnapshot(event)) {
         this.needsSnapshot = false;
         this.snapshotRequested = false;
         this.hasCadenceSnapshot = true;
+        this.awaitingCadenceSnapshot = false;
         this.detachedChunksSinceSnapshot = 0;
+      } else if (isFullSnapshot(event) && !this.awaitingCadenceSnapshot) {
+        // Keep historical payload-free marker behavior outside cadence recovery.
+        this.needsSnapshot = false;
+        this.snapshotRequested = false;
       }
       // An error buffer begins at its oldest retained event, not recorder start.
       if (this.pendingEvents.length === 0 && this.replayTypeFn?.() === 'buffer' &&
@@ -452,6 +463,7 @@ export class ReplayTransport {
     this.detachedChunksSinceSnapshot++;
     if (this.detachedChunksSinceSnapshot < 3) return;
     this.needsSnapshot = true;
+    this.awaitingCadenceSnapshot = true;
     this.requestFreshSnapshot();
   }
 
