@@ -6,14 +6,18 @@ class FakeDocument {
   visibilityState: 'visible' | 'hidden' = 'visible';
   private listeners = new Map<string, Set<(event: Event) => void>>();
 
-  addEventListener(name: string, handler: (event: Event) => void): void {
+  addEventListener(name: string, handler: (event: Event) => void, ..._options: unknown[]): void {
     const listeners = this.listeners.get(name) ?? new Set();
     listeners.add(handler);
     this.listeners.set(name, listeners);
   }
 
-  removeEventListener(name: string, handler: (event: Event) => void): void {
+  removeEventListener(name: string, handler: (event: Event) => void, ..._options: unknown[]): void {
     this.listeners.get(name)?.delete(handler);
+  }
+
+  dispatch(name: string, event = new Event(name)): void {
+    this.listeners.get(name)?.forEach((handler) => handler(event));
   }
 }
 
@@ -30,6 +34,7 @@ function config(serviceName = 'checkout'): ResolvedReplayConfig {
     apiKey: 'secret-api-key',
     endpoint: 'https://collector.example.test',
     serviceName,
+    identityUserId: '',
   };
 }
 
@@ -118,6 +123,23 @@ describe('replay identity boundaries', () => {
     second.destroy();
   });
 
+  it('returns a verified session and segment pair from one ownership claim', () => {
+    const storage = storageMap();
+    vi.stubGlobal('document', document);
+    vi.stubGlobal('sessionStorage', storage);
+    const first = new SessionManager(config());
+    const firstAllocation = first.allocateSegment();
+    const competing = new SessionManager(config());
+    const secondAllocation = first.allocateSegment();
+
+    expect(firstAllocation.segmentId).toBe(0);
+    expect(secondAllocation.segmentId).toBe(0);
+    expect(secondAllocation.sessionId).not.toBe(firstAllocation.sessionId);
+    expect(secondAllocation.sessionId).not.toBe(competing.getSessionId());
+    first.destroy();
+    competing.destroy();
+  });
+
   it('does not let a suspended owner reclaim a resumed identity', () => {
     const storage = storageMap();
     vi.stubGlobal('document', document);
@@ -161,5 +183,27 @@ describe('replay identity boundaries', () => {
     expect(manager.getSessionId()).not.toBe(firstId);
     expect([...storage.values.values()].join('\n')).not.toContain('user-b');
     manager.destroy();
+  });
+
+  it('persists activity updates and error-mode transitions', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const storage = storageMap();
+    vi.stubGlobal('document', document);
+    vi.stubGlobal('sessionStorage', storage);
+    const manager = new SessionManager(config());
+    vi.setSystemTime(250);
+    const input = new Event('pointerdown');
+    Object.defineProperty(input, 'isTrusted', { value: true });
+    document.dispatch('pointerdown', input);
+    const key = storageKeyForConfig(config());
+    expect(JSON.parse(storage.values.get(key)!).lastActivity).toBe(250);
+    manager.destroy();
+
+    const errorManager = new SessionManager({ ...config(), sessionSampleRate: 0, errorSampleRate: 1 });
+    errorManager.onEvent({ type: 2, timestamp: 250 }, false);
+    errorManager.onError();
+    expect(JSON.parse(storage.values.get(key)!).mode).toBe('session');
+    errorManager.destroy();
   });
 });
