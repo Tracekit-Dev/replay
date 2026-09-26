@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SessionManager } from '../src/session';
 import type { ResolvedReplayConfig } from '../src/types';
 
@@ -35,11 +35,20 @@ class FakeLocks {
 describe('SessionManager lifecycle', () => {
   const doc = new FakeDocument();
   const storage = new Map<string, string>();
+  const sharedCounters = new Map<string, string>();
+
+  beforeEach(() => {
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => sharedCounters.get(key) ?? null,
+      setItem: (key: string, value: string) => sharedCounters.set(key, value),
+    });
+  });
 
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     storage.clear();
+    sharedCounters.clear();
     doc.visibilityState = 'visible';
   });
 

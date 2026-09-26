@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SessionManager } from '../src/session';
 import { replayIntegration } from '../src/index';
 import type { ResolvedReplayConfig } from '../src/types';
@@ -39,6 +39,7 @@ async function createManager(resolved = config()) {
 }
 
 describe('Replay session identity', () => {
+  beforeEach(() => vi.stubGlobal('localStorage', storage()));
   afterEach(() => vi.unstubAllGlobals());
 
   it('namespaces persisted state by endpoint, service, and key digest without storing raw keys', async () => {
@@ -172,13 +173,16 @@ describe('Replay session identity', () => {
 
   it('rotates instead of emitting an unsafe next counter', async () => {
     const shared = storage();
+    const sharedCounter = storage();
     vi.stubGlobal('sessionStorage', shared);
+    vi.stubGlobal('localStorage', sharedCounter);
     vi.stubGlobal('navigator', { locks: new FakeLocks() });
     const first = await createManager();
     const key = [...shared.values.keys()][0];
     first.destroy();
     const previous = JSON.parse(shared.values.get(key)!);
     shared.values.set(key, JSON.stringify({ ...previous, segmentId: 0x7fff_fffe }));
+    sharedCounter.values.set(`${key}_${previous.sessionId}`, String(0x7fff_fffe));
     const manager = await createManager();
     const oldId = manager.getSessionId();
     expect(manager.nextSegmentId()).toBe(0x7fff_fffe);
@@ -198,8 +202,9 @@ describe('Replay session identity', () => {
       captureException: vi.fn(() => 'event-id'),
     };
     const integration = replayIntegration({ sessionSampleRate: 1 });
+    const previousRecorderCalls = recorderCalls.count;
     integration.install(client);
-    await vi.waitFor(() => expect(integration.getSessionId()).toMatch(/^[0-9a-f]{32}$/));
+    await vi.waitFor(() => expect(recorderCalls.count).toBeGreaterThan(previousRecorderCalls));
     const firstId = integration.getSessionId();
     userId = 'second';
     client.captureException(new Error('synthetic'));

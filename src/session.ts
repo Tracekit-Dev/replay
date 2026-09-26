@@ -95,6 +95,7 @@ export class SessionManager {
   private destroyed = false;
   private readyPromise: Promise<void>;
   private identityReady = false;
+  private keepFreshForPageview = false;
   private storageKey: string | null = null;
   private releaseClaim: (() => void) | null = null;
 
@@ -125,6 +126,14 @@ export class SessionManager {
   /** Recording and segment allocation must wait for this ownership decision. */
   ready(): Promise<void> { return this.readyPromise; }
 
+  /** Give an initial pageview a fresh ID without allowing an unsafe later restore. */
+  getPageviewSessionId(): string {
+    if (this.identityReady) return this.getSessionId();
+    if (!this.state.sessionId || this.state.mode === 'off' || !this.isVisible()) return '';
+    this.keepFreshForPageview = true;
+    return this.state.sessionId;
+  }
+
   private async initializeIdentity(): Promise<void> {
     const key = await storageNamespace(this.config);
     if (this.destroyed) return;
@@ -132,13 +141,32 @@ export class SessionManager {
       try {
         const raw = sessionStorage.getItem(key);
         const stored: unknown = raw ? JSON.parse(raw) : null;
-        if (validStored(stored, this.config) && await this.claim(key, stored.sessionId)) {
-          this.state = { ...stored, startedAt: Date.now(), lastActivity: Date.now() };
-          this.storageKey = key;
+        if (!this.keepFreshForPageview && validStored(stored, this.config) && await this.claim(key, stored.sessionId)) {
+          const current = localStorage.getItem(`${key}_${stored.sessionId}`);
+          if (current === String(stored.segmentId)) {
+            this.state = { ...stored, startedAt: Date.now(), lastActivity: Date.now() };
+            this.storageKey = key;
+          } else {
+            this.releaseClaim?.();
+            this.releaseClaim = null;
+          }
         }
-      } catch { /* Storage is optional. A fresh document ID remains safe. */ }
+      } catch {
+        this.releaseClaim?.();
+        this.releaseClaim = null;
+      }
       if (!this.storageKey && this.state.sessionId && await this.claim(key, this.state.sessionId)) {
-        this.storageKey = key;
+        try {
+          const counterKey = `${key}_${this.state.sessionId}`;
+          if (localStorage.getItem(counterKey) === null) {
+            localStorage.setItem(counterKey, '0');
+            if (localStorage.getItem(counterKey) === '0') this.storageKey = key;
+          }
+        } catch { /* No shared counter means no reload continuity. */ }
+        if (!this.storageKey) {
+          this.releaseClaim?.();
+          this.releaseClaim = null;
+        }
       }
     }
     if (this.destroyed) return;
@@ -318,7 +346,20 @@ export class SessionManager {
       queueMicrotask(() => { if (!this.destroyed) this.restartCallback?.(); });
       throw new Error('Replay segment counter is unsafe');
     }
-    const next = this.state.segmentId++;
+    const next = this.state.segmentId;
+    if (this.storageKey) {
+      try {
+        const counterKey = `${this.storageKey}_${this.state.sessionId}`;
+        if (localStorage.getItem(counterKey) !== String(next)) throw new Error('stale counter');
+        localStorage.setItem(counterKey, String(next + 1));
+        if (localStorage.getItem(counterKey) !== String(next + 1)) throw new Error('counter write failed');
+      } catch {
+        this.rotateIdentity();
+        queueMicrotask(() => { if (!this.destroyed) this.restartCallback?.(); });
+        throw new Error('Replay segment counter freshness is unproven');
+      }
+    }
+    this.state.segmentId++;
     this.persistSession();
     return next;
   }
@@ -327,6 +368,7 @@ export class SessionManager {
   rotateIdentity(): void {
     if (this.storageKey) {
       try { sessionStorage.setItem(this.storageKey, ''); } catch { /* No persistent identity remains usable. */ }
+      try { localStorage.setItem(`${this.storageKey}_${this.state.sessionId}`, 'invalid'); } catch { /* No restore is allowed without a valid shared counter. */ }
     }
     this.releaseClaim?.();
     this.releaseClaim = null;

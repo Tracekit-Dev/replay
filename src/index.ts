@@ -288,7 +288,7 @@ export function replayIntegration(
      * Useful for linking errors to replay sessions (Phase 26).
      */
     getSessionId(): string {
-      return session?.getSessionId() ?? '';
+      return session?.getPageviewSessionId() ?? '';
     },
   };
 
