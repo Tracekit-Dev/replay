@@ -681,6 +681,8 @@ export class ReplayTransport {
       if (attempt < this.config.maxRetryAttempts - 1) {
         const remaining = this.config.maxRetryAgeMs - (Date.now() - this.activeStartedAt);
         if (remaining <= 0) break;
+        // Never retry sooner than the server's explicit 429 delay.
+        if (retryAfter > this.config.maxBackoffMs || retryAfter > remaining) break;
         const backoff = Math.min(this.config.maxBackoffMs,
           this.config.retryBaseDelayMs * 2 ** attempt);
         this.status.retries++;
