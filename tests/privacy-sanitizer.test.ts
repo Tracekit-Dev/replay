@@ -9,6 +9,46 @@ vi.mock('rrweb', () => ({ record: recordMock }));
 const config = () => resolveReplayConfig({ unmask: ['.public'], block: ['.secret'] }, 'test-key', 'https://api.test');
 
 describe('privacy sanitizer', () => {
+  it('rejects malformed snapshot tags and attributes without granting a valid unmask rule', () => {
+    const resolved = resolveReplayConfig({ unmask: ['.public'] }, 'test-key', 'https://api.test');
+    const realDocument = globalThis.document;
+    vi.stubGlobal('document', {
+      createElement(tag: string) {
+        if (tag === 'div>') throw new Error('InvalidCharacterError');
+        return { setAttribute(name: string) { if (name.includes('>')) throw new Error('InvalidCharacterError'); }, matches: () => false };
+      },
+      querySelector: () => null,
+    });
+    try {
+      for (const attrs of [{ class: 'not-public' }, { class: 'not-public', 'bad>attribute': 'synthetic-secret-canary' }]) {
+        const sanitizer = new ReplayPrivacySanitizer(resolved);
+        const badTag = Object.hasOwn(attrs, 'bad>attribute') ? 'div' : 'div>';
+        const snapshot = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+          { type: 2, id: 2, tagName: badTag, attributes: attrs, childNodes: [{ type: 3, id: 3, textContent: 'synthetic-secret-canary' }] },
+        ] } } };
+        const safe = sanitizer.sanitize(snapshot);
+        expect(safe).toBeNull();
+        const late = sanitizer.sanitize({ type: 3, timestamp: 2, data: { source: 0, adds: [], texts: [{ id: 3, value: 'synthetic-secret-canary' }], attributes: [], removes: [] } });
+        expect(late).toBeNull();
+      }
+    } finally { vi.stubGlobal('document', realDocument); }
+  });
+
+  it('rejects malformed mutation additions and clears old unmask ancestry', () => {
+    const resolved = resolveReplayConfig({ unmask: ['.public'] }, 'test-key', 'https://api.test');
+    const sanitizer = new ReplayPrivacySanitizer(resolved);
+    const good = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+      { type: 2, id: 2, tagName: 'div', attributes: { class: 'public' }, childNodes: [{ type: 3, id: 3, textContent: 'allowed' }] },
+    ] } } };
+    expect(JSON.stringify(sanitizer.sanitize(good))).toContain('allowed');
+    const previousDocument = globalThis.document;
+    vi.stubGlobal('document', { createElement: () => { throw new Error('InvalidCharacterError'); }, querySelector: () => null });
+    try {
+      expect(sanitizer.sanitize({ type: 3, timestamp: 2, data: { source: 0, adds: [{ parentId: 2, nextId: null, node: { type: 2, id: 4, tagName: 'div>', attributes: { class: 'not-public' }, childNodes: [{ type: 3, id: 5, textContent: 'synthetic-secret-canary' }] } }], texts: [], attributes: [], removes: [] } })).toBeNull();
+      expect(sanitizer.sanitize({ type: 3, timestamp: 3, data: { source: 0, adds: [], texts: [{ id: 3, value: 'synthetic-secret-canary' }], attributes: [], removes: [] } })).toBeNull();
+    } finally { vi.stubGlobal('document', previousDocument); }
+    expect(JSON.stringify(sanitizer.sanitize({ ...good, timestamp: 4 }))).toContain('allowed');
+  });
   it('removes credentials, query strings, and fragments from URL fields', () => {
     expect(sanitizeReplayUrl('https://user:secret@example.test/path?token=canary#canary')).toBe('https://example.test/path');
     expect(sanitizeReplayUrl('javascript:canary')).toBe('');

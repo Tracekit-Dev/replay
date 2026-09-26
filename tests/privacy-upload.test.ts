@@ -5,6 +5,7 @@ import { ReplayTransport } from '../src/transport';
 import { CompressionWorker } from '../src/compression';
 import { replayIntegration } from '../src/index';
 import { SessionManager } from '../src/session';
+import { sanitizeReplayEvent } from '../src/privacy';
 
 const recorder = vi.hoisted(() => ({ emit: null as null | ((event: any, checkout: boolean) => void) }));
 vi.mock('../src/recorder', () => ({ startRecording: vi.fn((_config, emit) => { recorder.emit = emit; return () => {}; }) }));
@@ -14,8 +15,8 @@ const canary = 'synthetic-secret-canary';
 const secretEvent = { type: 5, timestamp: 100, data: { tag: 'console-log', payload: { level: 'error', message: canary, data: { nested: { secret: canary } }, stack: canary } } };
 const urlEvent = { type: 4, timestamp: 101, data: { href: `https://user:${canary}@site.test/path?token=${canary}#${canary}`, width: 100, height: 100 } };
 
-function transport() {
-  const config = resolveReplayConfig({}, 'test-key', 'https://api.test');
+function transport(replayConfig: Parameters<typeof resolveReplayConfig>[0] = {}) {
+  const config = resolveReplayConfig(replayConfig, 'test-key', 'https://api.test');
   const worker = { compress: vi.fn(async (events: any[]) => {
     const encoded = new TextEncoder().encode(JSON.stringify(events));
     return { compressed: gzipSync(encoded), originalSize: encoded.length };
@@ -30,6 +31,63 @@ function transport() {
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('serialized privacy upload paths', () => {
+  it('drops malformed snapshot and mutation canaries from fetch and retry bytes', async () => {
+    vi.stubGlobal('document', { querySelector: () => null, createElement: () => { throw new Error('InvalidCharacterError'); } });
+    vi.useFakeTimers();
+    const calls: RequestInit[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      calls.push(init);
+      return { ok: calls.length === 2, status: calls.length === 2 ? 200 : 500 };
+    }));
+    const instance = transport({ unmask: ['.public'] });
+    const malformed = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+      { type: 2, id: 2, tagName: 'div>', attributes: { class: 'not-public' }, childNodes: [{ type: 3, id: 3, textContent: canary }] },
+    ] } } };
+    instance.addEvent(malformed);
+    instance.addEvent({ type: 3, timestamp: 2, data: { source: 0, adds: [{ parentId: 2, nextId: null, node: { type: 2, id: 4, tagName: 'div', attributes: { 'bad>attribute': canary }, childNodes: [{ type: 3, id: 5, textContent: canary }] } }], texts: [], attributes: [], removes: [] } });
+    instance.addEvent(urlEvent);
+    const pending = instance.flush();
+    await vi.runAllTimersAsync();
+    await pending;
+    expect(calls).toHaveLength(2);
+    for (const call of calls) expect(decode(call.body as Uint8Array)).not.toContain(canary);
+    instance.destroy();
+    vi.useRealTimers();
+  });
+
+  it('drops malformed snapshot and attribute canaries from beacon and keepalive bytes', async () => {
+    vi.stubGlobal('document', { querySelector: () => null, createElement: () => { throw new Error('InvalidCharacterError'); } });
+    const beacon = vi.fn(() => false);
+    const fetchMock = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal('navigator', { sendBeacon: beacon });
+    vi.stubGlobal('fetch', fetchMock);
+    const instance = transport({ unmask: ['.public'] });
+    instance.addEvent({ type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+      { type: 2, id: 2, tagName: 'div>', attributes: { class: 'not-public', 'bad>attribute': canary }, childNodes: [{ type: 3, id: 3, textContent: canary }] },
+    ] } } });
+    instance.addEvent(urlEvent);
+    instance.flushSync();
+    expect(beacon).toHaveBeenCalledTimes(1);
+    expect(decode(new Uint8Array(await beacon.mock.calls[0][1].arrayBuffer()))).not.toContain(canary);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(decode(new Uint8Array(await fetchMock.mock.calls[0][1].body.arrayBuffer()))).not.toContain(canary);
+    instance.destroy();
+  });
+
+  it('rejects mutation of every sanitized graph before transport compression', async () => {
+    const safe = sanitizeReplayEvent(secretEvent);
+    expect(safe).not.toBeNull();
+    try { safe.data.payload.message = 'synthetic-mutated-canary'; } catch { /* Frozen graphs may reject writes. */ }
+    const calls: RequestInit[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => { calls.push(init); return { ok: true }; }));
+    const instance = transport();
+    instance.addEvent(safe);
+    await instance.flush();
+    expect(calls).toHaveLength(1);
+    expect(decode(calls[0].body as Uint8Array)).not.toContain('synthetic-mutated-canary');
+    instance.destroy();
+  });
+
   it('sanitizes rrweb output before the session and error ring buffer', () => {
     const onEvent = vi.spyOn(SessionManager.prototype, 'onEvent');
     const scope = { getUser: () => null, getTags: () => ({}), setTag: () => {}, removeTag: () => {}, subscribeBreadcrumb: () => () => {} };
