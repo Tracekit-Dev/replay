@@ -34,6 +34,16 @@ class PrivacyTokens {
   private classes = new Map<string, string>();
   private ids = new Map<string, string>();
   clear(): void { this.classes.clear(); this.ids.clear(); }
+  clone(): PrivacyTokens {
+    const copy = new PrivacyTokens();
+    copy.classes = new Map(this.classes);
+    copy.ids = new Map(this.ids);
+    return copy;
+  }
+  replaceWith(other: PrivacyTokens): void {
+    this.classes = new Map(other.classes);
+    this.ids = new Map(other.ids);
+  }
   className(raw: string): string {
     if (!raw || raw.length > 256) throw new Error('unsafe class');
     let token = this.classes.get(raw);
@@ -115,16 +125,52 @@ function cssStylesheet(raw: unknown, tokens: PrivacyTokens): string {
   const stripped = raw.replace(/\/\*[\s\S]*?\*\//g, '');
   if (stripped.includes('/*')) return '';
   const result: string[] = [];
-  const rule = /([^{}]+)\{([^{}]*)\}/g;
-  let end = 0;
-  for (const found of stripped.matchAll(rule)) {
-    if (stripped.slice(end, found.index).trim()) return '';
-    end = found.index + found[0].length;
-    const selector = cssSelector(found[1], tokens);
-    const declarations = cssDeclarations(found[2]);
+  let cursor = 0;
+  let scannedRules = 0;
+  while (cursor < stripped.length && scannedRules < 512) {
+    while (cursor < stripped.length && /\s/.test(stripped[cursor])) cursor++;
+    if (cursor >= stripped.length) break;
+    const start = cursor;
+    let quote = '';
+    let escaped = false;
+    let parentheses = 0;
+    for (; cursor < stripped.length; cursor++) {
+      const char = stripped[cursor];
+      if (escaped) { escaped = false; continue; }
+      if (quote && char === '\\') { escaped = true; continue; }
+      if (quote) { if (char === quote) quote = ''; continue; }
+      if (char === '"' || char === "'") { quote = char; continue; }
+      if (char === '(') parentheses++;
+      else if (char === ')') parentheses--;
+      if (parentheses < 0 || parentheses > 8) return result.join('');
+      if (parentheses === 0 && (char === '{' || char === ';' || char === '}')) break;
+    }
+    if (cursor >= stripped.length || stripped[cursor] === '}') break;
+    if (stripped[cursor] === ';') { cursor++; continue; }
+    const prelude = stripped.slice(start, cursor).trim();
+    const bodyStart = ++cursor;
+    let depth = 1;
+    quote = '';
+    escaped = false;
+    for (; cursor < stripped.length && depth > 0; cursor++) {
+      const char = stripped[cursor];
+      if (escaped) { escaped = false; continue; }
+      if (quote && char === '\\') { escaped = true; continue; }
+      if (quote) { if (char === quote) quote = ''; continue; }
+      if (char === '"' || char === "'") { quote = char; continue; }
+      if (char === '{' && ++depth > 8) return result.join('');
+      if (char === '}') depth--;
+    }
+    if (depth !== 0) break;
+    scannedRules++;
+    // Nested at-rules are unsupported. Their balanced block cannot erase safe siblings.
+    if (prelude.startsWith('@')) continue;
+    const body = stripped.slice(bodyStart, cursor - 1);
+    if (body.includes('{') || body.includes('}')) continue;
+    const selector = cssSelector(prelude, tokens);
+    const declarations = cssDeclarations(body);
     if (selector && declarations) result.push(`${selector}{${declarations}}`);
   }
-  if (stripped.slice(end).trim()) return '';
   return result.join('');
 }
 
@@ -162,7 +208,8 @@ interface NodePrivacy {
 }
 
 function effective(id: number | null, states: Map<number, NodePrivacy>, seen = new Set<number>()): { block: boolean; mask: boolean; unmask: boolean } {
-  if (id === null || seen.has(id)) return { block: false, mask: false, unmask: false };
+  if (id === null) return { block: false, mask: false, unmask: false };
+  if (seen.has(id)) return { block: true, mask: true, unmask: false };
   seen.add(id);
   const own = states.get(id);
   if (!own) return { block: false, mask: true, unmask: false };
@@ -278,6 +325,16 @@ function node(raw: any, depth: number, count: { value: number }, states: Map<num
   if (!raw || typeof raw !== 'object' || depth > MAX_DEPTH || ++count.value > MAX_NODES) throw new Error('unsafe node');
   const type = finite(raw.type), id = finite(raw.id);
   if (type === null || id === null || !Number.isSafeInteger(id)) throw new Error('unsafe node identity');
+  if (states.has(id)) throw new Error('duplicate active node identity');
+  if (parentId !== null) {
+    const lineage = new Set<number>([id]);
+    let ancestor: number | null = parentId;
+    while (ancestor !== null) {
+      if (lineage.has(ancestor) || !states.has(ancestor)) throw new Error('unsafe node ancestry');
+      lineage.add(ancestor);
+      ancestor = states.get(ancestor)!.parentId;
+    }
+  }
   const base: any = { type, id };
   states.set(id, { parentId, block: type === 2 && (raw.needBlock === true || isBlocked(raw, config)), mask: type === 2 && isMasked(raw, config), unmask: type === 2 && isUnmasked(raw, config), tagName: type === 2 ? raw.tagName?.toLowerCase() : undefined });
   if (states.size > MAX_NODES) throw new Error('unsafe node state');
@@ -309,7 +366,7 @@ function node(raw: any, depth: number, count: { value: number }, states: Map<num
 }
 
 /** Return an independent safe event, or null when no safe representation exists. */
-export function sanitizeReplayEvent(event: unknown, config?: ResolvedReplayConfig, states = new Map<number, NodePrivacy>(), tokens = new PrivacyTokens()): any | null {
+function sanitizeReplayEventDraft(event: unknown, config: ResolvedReplayConfig | undefined, states: Map<number, NodePrivacy>, tokens: PrivacyTokens): any | null {
   try {
     if (!event || typeof event !== 'object') return null;
     if (sanitizedEvents.has(event)) return isFrozenGraph(event) ? event : null;
@@ -337,7 +394,7 @@ export function sanitizeReplayEvent(event: unknown, config?: ResolvedReplayConfi
         for (const key of ['adds', 'texts', 'attributes', 'removes']) if (!Array.isArray(raw.data[key]) || raw.data[key].length > MAX_NODES) return null;
         const adds = raw.data.adds.flatMap((item: any) => {
           const parentId = finite(item.parentId);
-          if (parentId === null) return [];
+          if (parentId === null || !Number.isSafeInteger(parentId) || !states.has(parentId)) throw new Error('missing mutation parent');
           const protectedParent = effective(parentId, states).block;
           const cleaned = node(item.node, 0, count, states, parentId, tokens, config);
           return protectedParent ? [] : [{ parentId, nextId: finite(item.nextId), previousId: finite(item.previousId), node: cleaned }];
@@ -433,6 +490,24 @@ export function sanitizeReplayEvent(event: unknown, config?: ResolvedReplayConfi
     if (new TextEncoder().encode(JSON.stringify(safe)).byteLength > MAX_EVENT_BYTES) return null;
     freezeGraph(safe);
     sanitizedEvents.add(safe);
+    return safe;
+  } catch { return null; }
+}
+
+/** Commit ancestry and selector tokens only after a complete safe event exists. */
+export function sanitizeReplayEvent(event: unknown, config?: ResolvedReplayConfig, states = new Map<number, NodePrivacy>(), tokens = new PrivacyTokens()): any | null {
+  try {
+    const raw = event as any;
+    const staged = raw?.type === 2 || (raw?.type === 3 && (raw?.data?.source === 0 || raw?.data?.source === 8));
+    if (!staged) return sanitizeReplayEventDraft(event, config, states, tokens);
+    const nextStates = new Map<number, NodePrivacy>();
+    for (const [id, state] of states) nextStates.set(id, { ...state });
+    const nextTokens = tokens.clone();
+    const safe = sanitizeReplayEventDraft(event, config, nextStates, nextTokens);
+    if (!safe) return null;
+    states.clear();
+    for (const [id, state] of nextStates) states.set(id, state);
+    tokens.replaceWith(nextTokens);
     return safe;
   } catch { return null; }
 }

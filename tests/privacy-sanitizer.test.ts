@@ -26,6 +26,26 @@ describe('privacy sanitizer', () => {
     expect(sanitizer.sanitize({ ...snapshot, timestamp: 4 })).not.toBeNull();
   });
 
+  it('keeps direct sanitizer state atomic after a partial addition and rejects missing parents', () => {
+    const states = new Map<number, any>();
+    const resolved = resolveReplayConfig({ unmask: ['.public'] }, 'test-key', 'https://api.test');
+    const snapshot = { type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+      { type: 2, id: 2, tagName: 'div', attributes: {}, childNodes: [] },
+    ] } } };
+    expect(sanitizeReplayEvent(snapshot, resolved, states)).not.toBeNull();
+    const original = [...states.entries()];
+    const partial = { type: 3, timestamp: 2, data: { source: 0, adds: [
+      { parentId: 2, node: { type: 2, id: 5, tagName: 'div', attributes: { class: 'public' }, childNodes: [] } },
+      { parentId: 2, node: { type: 2, id: 2, tagName: 'div', attributes: { class: 'public' }, childNodes: [] } },
+    ], texts: [], attributes: [], removes: [] } };
+    expect(sanitizeReplayEvent(partial, resolved, states)).toBeNull();
+    expect([...states.entries()]).toEqual(original);
+    expect(sanitizeReplayEvent({ type: 3, timestamp: 3, data: { source: 0, adds: [
+      { parentId: 99, node: { type: 2, id: 6, tagName: 'div', attributes: {}, childNodes: [] } },
+    ], texts: [], attributes: [], removes: [] } }, resolved, states)).toBeNull();
+    expect([...states.entries()]).toEqual(original);
+  });
+
   it('retains safe top-level layout beside unsupported nested CSS in an actual rrweb rebuild', async () => {
     const page = new Window({ url: 'https://fixture.test/' });
     vi.stubGlobal('window', page);
@@ -185,11 +205,15 @@ describe('privacy sanitizer', () => {
   });
 
   it('sanitizes mutation additions, attributes, text, and inputs', () => {
+    const sanitizer = new ReplayPrivacySanitizer(config());
+    expect(sanitizer.sanitize({ type: 2, timestamp: 2, data: { initialOffset: { top: 0, left: 0 }, node: {
+      type: 0, id: 1, childNodes: [{ type: 2, id: 2, tagName: 'div', attributes: {}, childNodes: [{ type: 3, id: 3, textContent: 'safe' }] }],
+    } } })).not.toBeNull();
     const event = { type: 3, timestamp: 3, data: { source: 0,
       adds: [{ parentId: 1, nextId: null, node: { type: 2, id: 7, tagName: 'a', attributes: { href: 'https://u:canary@site.test/a?x=canary', 'data-secret': 'canary' }, childNodes: [{ type: 3, id: 8, textContent: 'canary' }] } }],
       texts: [{ id: 3, value: 'canary' }], attributes: [{ id: 7, attributes: { href: 'https://u:canary@site.test/b?x=canary', title: 'canary', value: 'canary' } }], removes: [],
     } };
-    const result = sanitizeReplayEvent(event, config());
+    const result = sanitizer.sanitize(event);
     expect(JSON.stringify(result)).not.toContain('canary');
     expect(JSON.stringify(result)).toContain('https://site.test/a');
     expect(JSON.stringify(result)).toContain('https://site.test/b');
