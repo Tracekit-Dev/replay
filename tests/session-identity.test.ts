@@ -45,19 +45,20 @@ describe('Replay session identity', () => {
   beforeEach(() => vi.stubGlobal('localStorage', storage()));
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
-  it('namespaces persisted state by endpoint, service, and key digest without storing raw keys', async () => {
+  it('uses distinct document IDs across project and key changes without storage writes', async () => {
     const shared = storage();
+    const counters = storage();
     vi.stubGlobal('sessionStorage', shared);
+    vi.stubGlobal('localStorage', counters);
     vi.stubGlobal('navigator', { locks: new FakeLocks() });
     const alpha = await createManager(config('alpha', 'secret-alpha'));
     const beta = await createManager(config('beta', 'secret-alpha'));
     const rotated = await createManager(config('alpha', 'secret-beta'));
     expect(new Set([alpha.getSessionId(), beta.getSessionId(), rotated.getSessionId()]).size).toBe(3);
-    expect(shared.values.size).toBe(3);
-    for (const key of shared.values.keys()) {
-      expect(key).not.toContain('secret-alpha');
-      expect(key).not.toContain('secret-beta');
-    }
+    expect(shared.values.size).toBe(0);
+    expect(counters.values.size).toBe(0);
+    expect(shared.setItem).not.toHaveBeenCalled();
+    expect(counters.setItem).not.toHaveBeenCalled();
     alpha.destroy(); beta.destroy(); rotated.destroy();
   });
 
@@ -77,16 +78,13 @@ describe('Replay session identity', () => {
     { sessionId: 'a'.repeat(32), segmentId: -1 },
     { sessionId: 'a'.repeat(32), segmentId: 1.5 },
   ])('starts fresh for invalid persisted identity %#', async (invalid) => {
-    const shared = storage();
+    const shared = storage(new Map([['__tracekit_replay_session_v2_old', JSON.stringify({ ...invalid, mode: 'session', lastActivity: Date.now() })]]));
     vi.stubGlobal('sessionStorage', shared);
     vi.stubGlobal('navigator', { locks: new FakeLocks() });
-    const first = await createManager();
-    const key = [...shared.values.keys()][0];
-    first.destroy();
-    shared.values.set(key, JSON.stringify({ ...invalid, mode: 'session', lastActivity: Date.now() }));
     const second = await createManager();
     expect(second.getSessionId()).not.toBe(invalid.sessionId);
     expect(second.nextSegmentId()).toBe(0);
+    expect(shared.getItem).not.toHaveBeenCalled();
     second.destroy();
   });
 
@@ -190,7 +188,7 @@ describe('Replay session identity', () => {
     one.destroy(); two.destroy();
   });
 
-  it('restores a valid counter only after a verified reload and lock release', async () => {
+  it('starts a fresh ID and zero counter on reload despite navigation evidence', async () => {
     const shared = storage();
     vi.stubGlobal('sessionStorage', shared);
     vi.stubGlobal('navigator', { locks: new FakeLocks() });
@@ -201,66 +199,69 @@ describe('Replay session identity', () => {
     vi.stubGlobal('location', { href: 'https://example.test/replay' });
     vi.stubGlobal('performance', { getEntriesByType: (name: string) => name === 'navigation' ? [{ type: 'reload', name: 'https://example.test/replay' }] : [] });
     const reload = await createManager();
-    expect(reload.getSessionId()).toBe(id);
-    expect(reload.nextSegmentId()).toBe(1);
+    expect(reload.getSessionId()).not.toBe(id);
+    expect(reload.nextSegmentId()).toBe(0);
     reload.destroy();
   });
 
-  it('removes a retired counter after identity rotation', async () => {
+  it('does not create a shared counter before or after identity rotation', async () => {
     const shared = storage();
     const counters = storage();
     vi.stubGlobal('sessionStorage', shared);
     vi.stubGlobal('localStorage', counters);
     vi.stubGlobal('navigator', { locks: new FakeLocks() });
     const manager = await createManager();
-    const retiredKey = [...counters.values.keys()][0];
+    expect(counters.values.size).toBe(0);
     manager.rotateIdentity();
-    expect(counters.values.has(retiredKey)).toBe(false);
+    expect(counters.values.size).toBe(0);
+    expect(counters.setItem).not.toHaveBeenCalled();
     manager.destroy();
   });
 
-  it('cleans expired counters while keeping live reload state', async () => {
+  it('leaves old persistent values inert without reading or writing them', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_700_000_000_000);
-    const counters = storage();
-    vi.stubGlobal('sessionStorage', storage());
+    const counters = storage(new Map([['__tracekit_replay_session_v2_old_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', JSON.stringify({ next: 3, expiresAt: 1 })]]));
+    const session = storage(new Map([['__tracekit_replay_session_v2_old', JSON.stringify({ sessionId: 'a'.repeat(32), segmentId: 3, mode: 'session', lastActivity: Date.now() })]]));
+    vi.stubGlobal('sessionStorage', session);
     vi.stubGlobal('localStorage', counters);
     vi.stubGlobal('navigator', { locks: new FakeLocks() });
     const first = await createManager();
-    const oldKey = [...counters.values.keys()][0];
     first.destroy();
-    expect(counters.values.has(oldKey)).toBe(true);
     vi.advanceTimersByTime(config().idleTimeout + 1);
     const second = await createManager();
-    expect(counters.values.has(oldKey)).toBe(false);
+    expect(counters.values.size).toBe(1);
+    expect(session.values.size).toBe(1);
+    expect(counters.getItem).not.toHaveBeenCalled();
+    expect(session.getItem).not.toHaveBeenCalled();
+    expect(counters.setItem).not.toHaveBeenCalled();
+    expect(session.setItem).not.toHaveBeenCalled();
     second.destroy();
   });
 
-  it('does not allocate a segment before ownership settles', async () => {
+  it('allocates from a fresh identity synchronously', async () => {
     vi.stubGlobal('sessionStorage', storage());
     vi.stubGlobal('navigator', { locks: new FakeLocks() });
     const manager = new SessionManager(config());
-    expect(() => manager.nextSegmentId()).toThrow('Replay identity is not ready');
-    await manager.ready();
+    expect(manager.getSessionId()).toMatch(/^[0-9a-f]{32}$/);
     expect(manager.nextSegmentId()).toBe(0);
+    await manager.ready();
+    expect(manager.nextSegmentId()).toBe(1);
+    manager.destroy();
+  });
+
+  it('stops recording if cryptographic IDs become unavailable during rotation', async () => {
+    const manager = await createManager();
+    vi.stubGlobal('crypto', undefined);
+    manager.rotateIdentity();
+    expect(manager.isActive()).toBe(false);
+    expect(manager.getSessionId()).toBe('');
     manager.destroy();
   });
 
   it('rotates instead of emitting an unsafe next counter', async () => {
-    const shared = storage();
-    const sharedCounter = storage();
-    vi.stubGlobal('sessionStorage', shared);
-    vi.stubGlobal('localStorage', sharedCounter);
-    vi.stubGlobal('navigator', { locks: new FakeLocks() });
-    const first = await createManager();
-    const key = [...shared.values.keys()][0];
-    first.destroy();
-    const previous = JSON.parse(shared.values.get(key)!);
-    shared.values.set(key, JSON.stringify({ ...previous, segmentId: 0x7fff_fffe }));
-    sharedCounter.values.set(`${key}_${previous.sessionId}`, JSON.stringify({ next: 0x7fff_fffe, expiresAt: Date.now() + config().idleTimeout }));
-    vi.stubGlobal('location', { href: 'https://example.test/replay' });
-    vi.stubGlobal('performance', { getEntriesByType: (name: string) => name === 'navigation' ? [{ type: 'reload', name: 'https://example.test/replay' }] : [] });
     const manager = await createManager();
+    (manager as unknown as { state: { segmentId: number } }).state.segmentId = 0x7fff_fffe;
     const oldId = manager.getSessionId();
     expect(manager.nextSegmentId()).toBe(0x7fff_fffe);
     expect(() => manager.nextSegmentId()).toThrow('Replay segment counter is unsafe');
