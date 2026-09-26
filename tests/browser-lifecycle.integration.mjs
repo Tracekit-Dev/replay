@@ -4,7 +4,8 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { gunzipSync } from 'node:zlib';
 
-const playwright = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const importedPlaywright = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const playwright = importedPlaywright.chromium ? importedPlaywright : importedPlaywright.default;
 const replayBundle = await readFile(new URL(process.env.REPLAY_BUNDLE || '../dist/index.global.js', import.meta.url));
 const browserBundle = await readFile(new URL(process.env.BROWSER_BUNDLE || '../../browser/dist/index.global.js', import.meta.url));
 const full = process.argv.includes('--full');
