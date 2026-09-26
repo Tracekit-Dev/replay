@@ -32,6 +32,17 @@ function serializedSize(value: unknown): number {
 function isFullSnapshot(event: any): boolean { return event?.type === 2; }
 function isDOMMutation(event: any): boolean { return event?.type === 3 && event?.data?.source === 0; }
 
+interface FrozenTerminal {
+  sessionId: string;
+  body: Uint8Array;
+  originalSize: number;
+  rawBytes: number;
+  events: number;
+  headers: Record<string, string>;
+  done: Promise<void>;
+  resolve: () => void;
+}
+
 // A service name is only a lookup hint. The server makes the scope decision.
 function boundedServiceName(name: string | undefined): string | null {
   if (name === undefined || name === '') return '';
@@ -45,6 +56,8 @@ function boundedServiceName(name: string | undefined): string | null {
 export class ReplayTransport {
   private pendingEvents: any[] = [];
   private pendingTimes: number[] = [];
+  private pendingSessionId = '';
+  private frozenTerminal: FrozenTerminal | null = null;
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private config: ResolvedReplayConfig;
   private compressionWorker: CompressionWorker;
@@ -108,8 +121,9 @@ export class ReplayTransport {
 
   getStatus(): ReplayStatus {
     return { ...this.status, queueBytes: this.totalBytes(),
-      queueEvents: this.pendingEvents.length + this.activeEvents,
-      queueChunks: Number(this.pendingEvents.length > 0) + Number(this.activeFlush !== null),
+      queueEvents: this.pendingEvents.length + this.activeEvents + (this.frozenTerminal?.events ?? 0),
+      queueChunks: Number(this.pendingEvents.length > 0) + Number(this.activeFlush !== null) +
+        Number(this.frozenTerminal !== null),
     };
   }
 
@@ -127,8 +141,13 @@ export class ReplayTransport {
   /** Reset only upload evidence when a new recording identity begins. */
   setSessionIdentity(sessionId: string): void {
     if (!sessionId || sessionId === this.reportingSessionId) return;
+    if (this.pendingEvents.length && this.pendingSessionId && this.pendingSessionId !== sessionId) {
+      this.dropPendingForOldIdentity();
+    }
     this.reportingSessionId = sessionId;
     this.dropBaselineTotal = this.status.droppedEvents;
+    this.clickCount = 0;
+    this.keypressCount = 0;
   }
 
   private reportedDrops(): string {
@@ -141,7 +160,10 @@ export class ReplayTransport {
     return () => { this.statusListeners.delete(listener); };
   }
 
-  private totalBytes(): number { return this.bufferSize + this.activeRawBytes + this.activeCompressedBytes; }
+  private totalBytes(): number {
+    return this.bufferSize + this.activeRawBytes + this.activeCompressedBytes +
+      (this.frozenTerminal?.body.byteLength ?? 0);
+  }
 
   private publishStatus(): void {
     if (this.statusTimer !== null || this.statusListeners.size === 0) return;
@@ -208,10 +230,14 @@ export class ReplayTransport {
     this.stop();
     this.pendingEvents = [];
     this.pendingTimes = [];
+    this.pendingSessionId = '';
+    this.frozenTerminal?.resolve();
+    this.frozenTerminal = null;
     this.bufferSize = 0;
     this.activeRawBytes = 0;
     this.activeCompressedBytes = 0;
     this.activeEvents = 0;
+    this.activeFlush = null;
     this.recordingWindowStart = null;
     this.sanitizer.clear();
     this.requestSnapshot = null;
@@ -253,6 +279,7 @@ export class ReplayTransport {
     const lastBytes = serializedSize(last);
     if (this.totalBytes() + firstBytes + lastBytes <= this.config.maxBufferSize &&
         this.pendingEvents.length + this.activeEvents + 2 <= this.config.maxEventCount) {
+      if (this.pendingEvents.length === 0) this.pendingSessionId = this.sessionIdFn?.() ?? '';
       this.pendingEvents.unshift(first);
       this.pendingTimes.unshift(Date.now());
       this.pendingEvents.push(last);
@@ -273,10 +300,26 @@ export class ReplayTransport {
     this.status.droppedBytes += this.bufferSize;
     this.pendingEvents = [];
     this.pendingTimes = [];
+    this.pendingSessionId = '';
     this.bufferSize = 0;
     this.needsSnapshot = true;
     this.status.reason = reason;
     this.requestFreshSnapshot();
+    this.publishStatus();
+  }
+
+  /** A rotated identity cannot inherit an older recording's pending events. */
+  private dropPendingForOldIdentity(): void {
+    if (!this.pendingEvents.length) return;
+    this.status.droppedEvents += this.pendingEvents.length;
+    this.status.droppedBytes += this.bufferSize;
+    this.status.droppedChunks++;
+    this.status.reason = 'queue_limit';
+    this.status.deliveryState = 'degraded';
+    this.pendingEvents = [];
+    this.pendingTimes = [];
+    this.pendingSessionId = '';
+    this.bufferSize = 0;
     this.publishStatus();
   }
 
@@ -285,6 +328,10 @@ export class ReplayTransport {
     this.snapshotRequested = true;
     queueMicrotask(() => {
       if (!this.destroyed && this.needsSnapshot && this.status.captureState !== 'failed') {
+        if (this.getStatus().queueChunks >= this.config.maxChunkCount) {
+          this.snapshotRequested = false;
+          return;
+        }
         try { this.requestSnapshot?.(); } catch { /* Keep capture isolated. */ }
       }
     });
@@ -328,13 +375,13 @@ export class ReplayTransport {
         return;
       }
       if (this.totalBytes() + eventSize > this.config.maxBufferSize ||
-          this.pendingEvents.length + this.activeEvents + 1 > this.config.maxEventCount ||
-          (this.activeFlush !== null && this.config.maxChunkCount < 2)) {
+          this.pendingEvents.length + this.activeEvents + (this.frozenTerminal?.events ?? 0) + 1 > this.config.maxEventCount ||
+          (this.pendingEvents.length === 0 && Number(this.activeFlush !== null) + Number(this.frozenTerminal !== null) >= this.config.maxChunkCount)) {
         this.dropPending('queue_limit');
       }
       if (this.totalBytes() + eventSize > this.config.maxBufferSize ||
-          this.pendingEvents.length + this.activeEvents + 1 > this.config.maxEventCount ||
-          (this.activeFlush !== null && this.config.maxChunkCount < 2)) {
+          this.pendingEvents.length + this.activeEvents + (this.frozenTerminal?.events ?? 0) + 1 > this.config.maxEventCount ||
+          (this.pendingEvents.length === 0 && Number(this.activeFlush !== null) + Number(this.frozenTerminal !== null) >= this.config.maxChunkCount)) {
         this.status.droppedEvents++;
         this.status.droppedBytes += eventSize;
         this.status.reason = 'queue_limit';
@@ -369,6 +416,7 @@ export class ReplayTransport {
 
       this.pendingEvents.push(event);
       this.pendingTimes.push(Date.now());
+      if (this.pendingEvents.length === 1) this.pendingSessionId = this.sessionIdFn?.() ?? '';
       this.bufferSize += eventSize;
       this.status.acceptedEvents++;
       this.publishStatus();
@@ -396,10 +444,11 @@ export class ReplayTransport {
    */
   async flush(final = false): Promise<void> {
     if (this.destroyed) return;
-    if (this.activeFlush) return this.activeFlush;
+    if (this.activeFlush && !final) return this.activeFlush;
     const generation = this.generation;
     this.appendRecordingBoundaries();
     this.expirePending();
+    if (this.activeFlush) return this.freezeTerminalChunk();
     if (this.pendingEvents.length === 0) {
       return;
     }
@@ -407,6 +456,7 @@ export class ReplayTransport {
     const rawBytes = this.bufferSize;
     this.pendingEvents = [];
     this.pendingTimes = [];
+    this.pendingSessionId = '';
     this.bufferSize = 0;
     this.activeRawBytes = rawBytes;
     this.activeEvents = events.length;
@@ -462,6 +512,8 @@ export class ReplayTransport {
         this.activeSessionId = '';
         if (this.activeFlush === job) this.activeFlush = null;
         if (this.status.deliveryState !== 'degraded') this.status.deliveryState = this.pendingEvents.length ? 'pending' : 'idle';
+        if (this.frozenTerminal && !this.destroyed) this.runFrozenTerminal(this.frozenTerminal, generation);
+        if (this.needsSnapshot) this.requestFreshSnapshot();
         this.publishStatus();
       }
     }
@@ -469,18 +521,101 @@ export class ReplayTransport {
     return job;
   }
 
+  /** Freeze a known final segment before its recording identity can rotate. */
+  private freezeTerminalChunk(): Promise<void> {
+    if (this.frozenTerminal) {
+      this.dropPendingForOldIdentity();
+      return this.frozenTerminal.done;
+    }
+    if (!this.pendingEvents.length) return this.activeFlush ?? Promise.resolve();
+    if (this.config.maxChunkCount < 2 || this.bufferSize > FALLBACK_INPUT_LIMIT) {
+      this.dropPendingForOldIdentity();
+      return this.activeFlush ?? Promise.resolve();
+    }
+    try {
+      const sessionId = this.pendingSessionId || this.sessionIdFn?.() || '';
+      if (!sessionId || boundedServiceName(this.config.serviceName) === null) {
+        this.dropPendingForOldIdentity();
+        return this.activeFlush ?? Promise.resolve();
+      }
+      const segmentId = this.segmentIdFn?.() ?? 0;
+      const encoded = textEncoder.encode(JSON.stringify(this.pendingEvents));
+      if (encoded.byteLength > FALLBACK_INPUT_LIMIT) {
+        this.dropPendingForOldIdentity();
+        return this.activeFlush ?? Promise.resolve();
+      }
+      const body = gzipSync(encoded, { level: 6 });
+      if (this.activeRawBytes + this.activeCompressedBytes + body.byteLength > this.config.maxBufferSize) {
+        this.dropPendingForOldIdentity();
+        return this.activeFlush ?? Promise.resolve();
+      }
+      const headers = this.uploadHeaders(segmentId, true, this.reportedDrops());
+      const rawBytes = this.bufferSize;
+      const events = this.pendingEvents.length;
+      let resolve!: () => void;
+      const done = new Promise<void>((finish) => { resolve = finish; });
+      this.frozenTerminal = { sessionId, body, originalSize: encoded.byteLength,
+        rawBytes, events, headers, done, resolve };
+      this.pendingEvents = [];
+      this.pendingTimes = [];
+      this.pendingSessionId = '';
+      this.bufferSize = 0;
+      this.publishStatus();
+      return done;
+    } catch {
+      this.dropPendingForOldIdentity();
+      return this.activeFlush ?? Promise.resolve();
+    }
+  }
+
+  /** Drain one already-frozen final chunk after the active chunk settles. */
+  private runFrozenTerminal(terminal: FrozenTerminal, generation: number): void {
+    if (this.frozenTerminal !== terminal || this.destroyed || generation !== this.generation) return;
+    this.frozenTerminal = null;
+    this.activeRawBytes = 0;
+    this.activeCompressedBytes = terminal.body.byteLength;
+    this.activeEvents = terminal.events;
+    this.activeStartedAt = Date.now();
+    this.activeSessionId = terminal.sessionId;
+    this.status.deliveryState = 'pending';
+    let finish!: () => void;
+    const job = new Promise<void>((resolve) => { finish = resolve; });
+    this.activeFlush = job;
+    void this.uploadWithRetry(terminal.sessionId, terminal.body, terminal.originalSize,
+      terminal.headers, generation).catch(() => {
+      if (!this.destroyed && generation === this.generation) this.dropActive('retry_exhausted');
+    }).finally(() => {
+      if (generation === this.generation) {
+        this.activeRawBytes = 0;
+        this.activeCompressedBytes = 0;
+        this.activeEvents = 0;
+        this.activeStartedAt = 0;
+        this.activeSessionId = '';
+        if (this.activeFlush === job) this.activeFlush = null;
+        if (this.status.deliveryState !== 'degraded') this.status.deliveryState = this.pendingEvents.length ? 'pending' : 'idle';
+        if (this.needsSnapshot) this.requestFreshSnapshot();
+        this.publishStatus();
+      }
+      terminal.resolve();
+      finish();
+    });
+  }
+
   private dropActive(reason: ReplayStatus['reason']): void {
+    const affectsCurrentIdentity = !this.activeSessionId || this.activeSessionId === this.reportingSessionId;
     this.status.droppedEvents += this.activeEvents;
-    if (this.activeSessionId && this.activeSessionId !== this.reportingSessionId) {
+    if (!affectsCurrentIdentity) {
       this.dropBaselineTotal += this.activeEvents;
     }
-    this.status.droppedBytes += this.activeRawBytes;
+    this.status.droppedBytes += this.activeRawBytes || this.activeCompressedBytes;
     this.status.droppedChunks++;
     this.status.deliveryState = 'degraded';
     // A missing chunk can invalidate later mutations, even when an older snapshot exists.
-    this.needsSnapshot = true;
-    this.dropPending('queue_limit');
-    this.requestFreshSnapshot();
+    if (affectsCurrentIdentity) {
+      this.needsSnapshot = true;
+      this.dropPending('queue_limit');
+      this.requestFreshSnapshot();
+    }
     this.status.reason = reason;
     this.publishStatus();
   }
