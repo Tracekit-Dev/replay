@@ -19,6 +19,12 @@ interface PendingCompression {
   reject: (err: Error) => void;
   events: any[];
   generation: number;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface CompressionOptions {
+  timeoutMs?: number;
+  maxPending?: number;
 }
 
 export class CompressionWorker {
@@ -27,8 +33,12 @@ export class CompressionWorker {
   private useMainThread = false;
   private nextRequestId = 0;
   private generation = 0;
+  private timeoutMs: number;
+  private maxPending: number;
 
-  constructor() {
+  constructor(options: CompressionOptions = {}) {
+    this.timeoutMs = Number.isFinite(options.timeoutMs) && (options.timeoutMs ?? 0) > 0 ? options.timeoutMs! : 5_000;
+    this.maxPending = Number.isFinite(options.maxPending) && (options.maxPending ?? 0) > 0 ? Math.floor(options.maxPending!) : 4;
     this.initWorker();
   }
 
@@ -48,6 +58,7 @@ export class CompressionWorker {
         const pending = this.pendingCallbacks.get(segmentId);
         if (!pending) return;
         this.pendingCallbacks.delete(segmentId);
+        clearTimeout(pending.timer);
         if (pending.generation !== this.generation) {
           pending.reject(new Error('Replay compression result is stale'));
           return;
@@ -79,6 +90,7 @@ export class CompressionWorker {
         this.worker?.terminate();
         this.worker = null;
         for (const pending of this.pendingCallbacks.values()) {
+          clearTimeout(pending.timer);
           if (pending.generation !== this.generation) {
             pending.reject(new Error('Replay compression result is stale'));
             continue;
@@ -119,13 +131,22 @@ export class CompressionWorker {
     }
 
     return new Promise((resolve, reject) => {
-      const entry: PendingCompression = { resolve, reject, events, generation };
+      if (this.pendingCallbacks.size >= this.maxPending) {
+        reject(new Error('Replay compression queue is full'));
+        return;
+      }
+      const entry: PendingCompression = { resolve, reject, events, generation, timer: null as unknown as ReturnType<typeof setTimeout> };
       // Session segment numbers restart at zero; worker requests never reuse them.
       const requestId = this.nextRequestId++;
+      entry.timer = setTimeout(() => {
+        if (!this.pendingCallbacks.delete(requestId)) return;
+        reject(new Error('Replay compression timed out'));
+      }, this.timeoutMs);
       this.pendingCallbacks.set(requestId, entry);
       try {
         this.worker!.postMessage({ events, segmentId: requestId });
       } catch {
+        clearTimeout(entry.timer);
         this.pendingCallbacks.delete(requestId);
         this.compressMainThread(events).then((data) => {
           if (generation === this.generation) resolve(data);
@@ -154,6 +175,7 @@ export class CompressionWorker {
   cancel(): void {
     this.generation += 1;
     for (const pending of this.pendingCallbacks.values()) {
+      clearTimeout(pending.timer);
       pending.reject(new Error('Replay compression cancelled'));
     }
     this.pendingCallbacks.clear();

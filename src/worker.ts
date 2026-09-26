@@ -32,8 +32,9 @@ self.onmessage = function(e) {
     var reader = cs.readable.getReader();
     var chunks = [];
 
-    writer.write(encoded);
-    writer.close();
+    writer.write(encoded).then(function() { return writer.close(); }).catch(function(err) {
+      self.postMessage({ error: err.message || 'Compression write failed', segmentId: data.segmentId });
+    });
 
     function readChunks() {
       reader.read().then(function(result) {

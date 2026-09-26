@@ -14,7 +14,7 @@
  * The transport NEVER throws -- replay must never crash the host app.
  */
 
-import type { ReplayIdentity, ReplaySegmentAllocation, ResolvedReplayConfig } from './types';
+import type { ReplayIdentity, ReplaySegmentAllocation, ReplayStatus, ReplayStatusListener, ResolvedReplayConfig } from './types';
 import { gzipSync } from 'fflate';
 import { CompressionWorker } from './compression';
 import { sanitizeMetadataValue, sanitizeReplayEvents, sanitizeReplayUrl } from './privacy';
@@ -26,12 +26,18 @@ const MAX_ATTEMPTS = 3;
 // sendBeacon has a ~64KB payload limit
 const BEACON_SIZE_LIMIT = 65536;
 
+function utf8Size(value: unknown): number {
+  try { return new TextEncoder().encode(JSON.stringify(value) ?? '').byteLength; } catch { return 0; }
+}
+
 export class ReplayTransport {
   private pendingEvents: any[] = [];
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private config: ResolvedReplayConfig;
   private compressionWorker: CompressionWorker;
   private bufferSize = 0;
+  private activeChunkBytes = 0;
+  private inflightPayloadBytes = 0;
   private recordingWindowStart: number | null = null;
   private recordingDeadlineFn: (() => number) | null = null;
   private allocateSegmentFn: (() => ReplaySegmentAllocation) | null = null;
@@ -41,6 +47,28 @@ export class ReplayTransport {
   private activeRequests = new Set<AbortController>();
   private retryWaiters = new Map<ReturnType<typeof setTimeout>, (active: boolean) => void>();
   private cancelled = false;
+  private hasStarted = false;
+  private awaitingSnapshot = false;
+  private retainedBufferHistory = false;
+  private pendingRegionHadSnapshot = false;
+  private activeCompressions = 0;
+  private listeners = new Set<ReplayStatusListener>();
+  private publishQueued = false;
+  private status: ReplayStatus = {
+    state: 'idle',
+    captureState: 'idle',
+    deliveryState: 'idle',
+    pendingBytes: 0,
+    pendingEvents: 0,
+    pendingChunks: 0,
+    inflightPayloads: 0,
+    inflightFetches: 0,
+    acknowledgedChunks: 0,
+    droppedChunks: 0,
+    droppedEvents: 0,
+    unknownChunks: 0,
+    lastReason: null,
+  };
 
   // Interaction counters (accumulated across all chunks)
   private clickCount = 0;
@@ -56,6 +84,46 @@ export class ReplayTransport {
   constructor(config: ResolvedReplayConfig, compressionWorker: CompressionWorker) {
     this.config = config;
     this.compressionWorker = compressionWorker;
+  }
+
+  getStatus(): ReplayStatus {
+    return {
+      ...this.status,
+      pendingBytes: this.bufferSize + this.activeChunkBytes + this.inflightPayloadBytes,
+      pendingEvents: this.pendingEvents.length,
+      pendingChunks: this.activeCompressions,
+      inflightFetches: this.activeRequests.size,
+    };
+  }
+
+  subscribeStatus(listener: ReplayStatusListener): () => void {
+    this.listeners.add(listener);
+    listener(this.getStatus());
+    return () => this.listeners.delete(listener);
+  }
+
+  private publish(reason?: string): void {
+    if (reason && !reason.startsWith('chunk_') && !reason.startsWith('upload_') && !reason.startsWith('capture_')) {
+      this.status.lastReason = reason;
+    }
+    if (this.publishQueued) return;
+    this.publishQueued = true;
+    const notify = () => {
+      this.publishQueued = false;
+      const snapshot = this.getStatus();
+      for (const listener of this.listeners) {
+        try { listener(snapshot); } catch { /* Observers cannot break capture. */ }
+      }
+    };
+    if (typeof queueMicrotask === 'function') queueMicrotask(notify);
+    else Promise.resolve().then(notify);
+  }
+
+  private outcome(outcome: 'acknowledged' | 'dropped' | 'unknown', reason: string): void {
+    if (outcome === 'acknowledged') this.status.acknowledgedChunks++;
+    if (outcome === 'dropped') this.status.droppedChunks++;
+    if (outcome === 'unknown') this.status.unknownChunks++;
+    this.publish(reason);
   }
 
   // ---------------------------------------------------------------------------
@@ -88,6 +156,11 @@ export class ReplayTransport {
     this.allocateSegmentFn = allocateSegment ?? null;
     this.identityFn = getIdentity ?? null;
     this.cancelled = false;
+    this.status.state = 'recording';
+    this.status.captureState = 'recording';
+    this.status.deliveryState = 'idle';
+    this.hasStarted = true;
+    this.publish('started');
 
     // Start periodic flush at config.flushInterval (default 30s)
     this.flushTimer = setInterval(() => {
@@ -107,6 +180,16 @@ export class ReplayTransport {
     }
   }
 
+  /** Require a fresh snapshot before the next session region can upload. */
+  expectSnapshot(): void {
+    this.awaitingSnapshot = true;
+    this.retainedBufferHistory = false;
+    this.pendingRegionHadSnapshot = false;
+    this.pendingEvents = [];
+    this.bufferSize = 0;
+    this.publish('snapshot_required');
+  }
+
   /**
    * Destroy the transport: stop + clear all pending events.
    */
@@ -121,6 +204,9 @@ export class ReplayTransport {
     this.cancelled = true;
     this.pendingEvents = [];
     this.bufferSize = 0;
+    this.pendingRegionHadSnapshot = false;
+    this.awaitingSnapshot = this.hasStarted;
+    this.retainedBufferHistory = false;
     this.recordingWindowStart = null;
     this.pendingIdentity = null;
     for (const controller of this.activeRequests) controller.abort();
@@ -130,17 +216,27 @@ export class ReplayTransport {
       this.retryWaiters.delete(timer);
       resolve(false);
     }
+    this.status.state = 'stopped';
+    this.status.captureState = 'stopped';
+    this.status.deliveryState = 'stopped';
+    this.publish('cancelled');
   }
 
   /** Start a visible recorder interval. Hidden time never belongs to a chunk. */
   startRecordingWindow(): void {
     this.recordingWindowStart = Date.now();
+    this.status.captureState = 'recording';
+    this.publish('capture_recording');
   }
 
   /** Close the interval before stopping, hiding, or changing session identity. */
   stopRecordingWindow(): void {
     this.appendRecordingBoundaries();
     this.recordingWindowStart = null;
+    if (!this.cancelled) {
+      this.status.captureState = 'suspended';
+      this.publish('capture_suspended');
+    }
   }
 
   private appendRecordingBoundaries(): void {
@@ -155,8 +251,8 @@ export class ReplayTransport {
       type: 5, timestamp,
       data: { tag: 'tracekit.recording-boundary', payload: { kind } },
     });
-    this.pendingEvents.unshift(boundary('start', start));
-    this.pendingEvents.push(boundary('end', end));
+    this.enqueuePendingEvent(boundary('start', start), true, false);
+    this.enqueuePendingEvent(boundary('end', end), false, false);
     this.recordingWindowStart = end;
   }
 
@@ -172,7 +268,18 @@ export class ReplayTransport {
     try {
       if (this.cancelled) return;
       const safeEvent = sanitizeReplayEvents([event], { unmask: this.config.unmask, blockMedia: this.config.blockMedia })[0];
-      if (!safeEvent) return;
+      if (!safeEvent) {
+        if (event?.type === 2) {
+          this.pendingEvents = [];
+          this.bufferSize = 0;
+          this.pendingRegionHadSnapshot = false;
+          this.awaitingSnapshot = true;
+          this.retainedBufferHistory = false;
+          this.status.droppedEvents++;
+          this.publish('snapshot_rejected');
+        }
+        return;
+      }
       event = safeEvent;
       if (this.pendingEvents.length === 0 && this.identityFn) {
         this.pendingIdentity = this.identityFn();
@@ -191,28 +298,7 @@ export class ReplayTransport {
         this.keypressCount++;
       }
 
-      const eventSize = JSON.stringify(event).length;
-      this.pendingEvents.push(event);
-      this.bufferSize += eventSize;
-
-      // Drop oldest events if buffer exceeds max size
-      while (this.bufferSize > this.config.maxBufferSize && this.pendingEvents.length > 1) {
-        const dropped = this.pendingEvents.shift();
-        if (dropped) {
-          try {
-            this.bufferSize -= JSON.stringify(dropped).length;
-          } catch {
-            // Ignore sizing errors on drop
-          }
-        }
-        const firstTimestamp = this.pendingEvents[0]?.timestamp;
-        if (this.recordingWindowStart !== null && Number.isFinite(firstTimestamp)) {
-          this.recordingWindowStart = Math.max(this.recordingWindowStart, firstTimestamp);
-        }
-        if (this.config.maxBufferSize > 0) {
-          console.warn('[TraceKit Replay] Buffer exceeded maxBufferSize, dropping oldest events');
-        }
-      }
+      this.enqueuePendingEvent(event);
     } catch {
       // Never crash the host app
     }
@@ -224,6 +310,101 @@ export class ReplayTransport {
   addEvents(events: any[]): void {
     for (const event of events) {
       this.addEvent(event);
+    }
+  }
+
+  private enqueuePendingEvent(event: any, prepend = false, evictAge = true): void {
+    if (this.awaitingSnapshot && event?.type !== 2 && !this.retainedBufferHistory) {
+      this.status.droppedEvents++;
+      return;
+    }
+    const bytes = utf8Size(event);
+    if (bytes <= 0) return;
+    if (bytes > this.config.maxBufferSize) {
+      this.status.droppedEvents++;
+      this.publish('snapshot_too_large');
+      if (event?.type === 2) {
+        this.pendingEvents = [];
+        this.bufferSize = 0;
+        this.pendingRegionHadSnapshot = false;
+        this.awaitingSnapshot = true;
+        this.retainedBufferHistory = this.replayTypeFn?.() === 'buffer';
+      }
+      return;
+    }
+    if (event?.type === 2) {
+      this.awaitingSnapshot = false;
+      this.retainedBufferHistory = false;
+      this.pendingRegionHadSnapshot = true;
+    }
+    if (prepend) this.pendingEvents.unshift(event);
+    else this.pendingEvents.push(event);
+    this.bufferSize += bytes;
+    if (evictAge) this.evictPendingAge();
+    this.enforcePendingBounds();
+  }
+
+  private evictPendingAge(): void {
+    const cutoff = Date.now() - this.config.maxBufferAgeMs;
+    while (this.pendingEvents.length > 0 && Number(this.pendingEvents[0]?.timestamp ?? Date.now()) < cutoff) {
+      const dropped = this.pendingEvents.shift();
+      this.bufferSize -= utf8Size(dropped);
+      this.status.droppedEvents++;
+    }
+    this.removePendingOrphans();
+  }
+
+  private enforcePendingBounds(): void {
+    while (this.pendingEvents.length > this.config.maxBufferEvents || this.bufferSize > this.config.maxBufferSize) {
+      if (this.pendingEvents.length <= 1) {
+        const dropped = this.pendingEvents[0];
+        this.pendingEvents = [];
+        this.bufferSize = 0;
+        this.pendingRegionHadSnapshot = false;
+        this.status.droppedEvents++;
+        if (dropped?.type === 2) {
+          this.awaitingSnapshot = true;
+          this.retainedBufferHistory = false;
+        }
+        this.publish('snapshot_too_large');
+        return;
+      }
+      const dropped = this.pendingEvents.shift();
+      this.bufferSize -= utf8Size(dropped);
+      this.status.droppedEvents++;
+      if (dropped?.type === 2) {
+        this.awaitingSnapshot = true;
+        this.retainedBufferHistory = this.replayTypeFn?.() === 'buffer';
+      }
+      this.publish('queue_limit');
+    }
+    if (this.awaitingSnapshot && !this.retainedBufferHistory && this.pendingEvents.length > 0) {
+      this.status.droppedEvents += this.pendingEvents.length;
+      this.pendingEvents = [];
+      this.bufferSize = 0;
+      this.pendingRegionHadSnapshot = false;
+      this.publish('snapshot_required');
+    }
+  }
+
+  private removePendingOrphans(): void {
+    const snapshot = this.pendingEvents.findIndex((event) => event?.type === 2);
+    if (snapshot < 0 && this.pendingRegionHadSnapshot && this.pendingEvents.length > 0) {
+      this.awaitingSnapshot = true;
+      this.retainedBufferHistory = this.replayTypeFn?.() === 'buffer';
+      if (!this.retainedBufferHistory) {
+        this.status.droppedEvents += this.pendingEvents.length;
+        this.pendingEvents = [];
+        this.bufferSize = 0;
+        this.pendingRegionHadSnapshot = false;
+        this.publish('snapshot_required');
+      }
+      return;
+    }
+    if (snapshot > 0) {
+      const removed = this.pendingEvents.splice(0, snapshot);
+      this.bufferSize -= removed.reduce((total, event) => total + utf8Size(event), 0);
+      this.status.droppedEvents += removed.length;
     }
   }
 
@@ -243,15 +424,42 @@ export class ReplayTransport {
       return;
     }
 
+    if (this.activeCompressions >= 4) {
+      this.status.droppedEvents += this.pendingEvents.length;
+      this.pendingEvents = [];
+      this.bufferSize = 0;
+      this.outcome('dropped', 'compression_queue_limit');
+      return;
+    }
+
     // Swap buffer atomically
     const events = this.pendingEvents;
     this.pendingEvents = [];
     this.bufferSize = 0;
+    this.pendingRegionHadSnapshot = false;
+    const flushedBufferedHistory = this.retainedBufferHistory;
+    if (flushedBufferedHistory) this.retainedBufferHistory = false;
     const pendingIdentity = this.pendingIdentity;
     this.pendingIdentity = null;
 
+    this.activeCompressions++;
+    const chunkBytes = events.reduce((total, event) => total + utf8Size(event), 0);
+    this.activeChunkBytes += chunkBytes;
+    this.publish('chunk_queued');
+    if (flushedBufferedHistory) this.awaitingSnapshot = true;
+    if (this.replayTypeFn?.() === 'buffer' && (this.awaitingSnapshot || !events.some((event) => event?.type === 2))) {
+      this.status.droppedEvents += events.length;
+      this.outcome('dropped', 'snapshot_required');
+      this.activeChunkBytes -= chunkBytes;
+      this.activeCompressions--;
+      this.publish('chunk_finished');
+      return;
+    }
     try {
-      if (!this.isCurrent(generation)) return;
+      if (!this.isCurrent(generation)) {
+        this.outcome('unknown', 'cancelled');
+        return;
+      }
       const allocation = this.allocateSegmentFn?.() ?? {
         sessionId: this.sessionIdFn ? this.sessionIdFn() : '',
         segmentId: this.segmentIdFn ? this.segmentIdFn() : 0,
@@ -261,26 +469,50 @@ export class ReplayTransport {
       const { sessionId, segmentId } = allocation;
 
       if (!sessionId) {
+        this.outcome('dropped', 'missing_session');
         return; // No session -- discard events
       }
       if (pendingIdentity && (pendingIdentity.sessionId !== allocation.sessionId || pendingIdentity.userId !== allocation.userId)) {
+        this.outcome('dropped', 'identity_changed');
         return; // Do not attribute events across an identity boundary.
       }
 
       const safeEvents = sanitizeReplayEvents(events, { unmask: this.config.unmask, blockMedia: this.config.blockMedia });
-      if (safeEvents.length === 0) return;
+      if (safeEvents.length === 0) {
+        this.outcome('dropped', 'sanitized_empty');
+        return;
+      }
+
+      if (safeEvents.length > this.config.maxChunkEvents) {
+        this.outcome('dropped', 'chunk_event_limit');
+        return;
+      }
 
       const headers = this.uploadHeaders(segmentId, allocation.userId, allocation.mode);
 
       // Compress via worker (or main-thread fallback)
       const { compressed, originalSize } = await this.compressionWorker.compress(safeEvents, segmentId);
-      if (!this.isCurrent(generation)) return;
+      if (!this.isCurrent(generation)) {
+        this.outcome('unknown', 'cancelled');
+        return;
+      }
+
+      if (compressed.byteLength > this.config.maxChunkBytes) {
+        this.outcome('dropped', 'chunk_byte_limit');
+        return;
+      }
 
       // Upload with retry
-      await this.uploadWithRetry(sessionId, compressed, originalSize, headers, generation);
+      const outcome = await this.uploadWithRetry(sessionId, compressed, originalSize, headers, generation);
+      this.outcome(outcome.state, outcome.reason);
       if (!this.isCurrent(generation)) return;
     } catch {
-      // Drop chunk on any unexpected error -- replay data loss is acceptable
+      this.outcome('dropped', 'flush_error');
+    } finally {
+      this.activeChunkBytes -= chunkBytes;
+      this.activeCompressions--;
+      if (this.activeCompressions === 0 && !this.cancelled) this.status.deliveryState = 'idle';
+      this.publish('chunk_finished');
     }
   }
 
@@ -306,6 +538,8 @@ export class ReplayTransport {
       const events = this.pendingEvents;
       this.pendingEvents = [];
       this.bufferSize = 0;
+      const flushedBufferedHistory = this.retainedBufferHistory;
+      if (flushedBufferedHistory) this.retainedBufferHistory = false;
       const pendingIdentity = this.pendingIdentity;
       this.pendingIdentity = null;
 
@@ -317,20 +551,41 @@ export class ReplayTransport {
       };
       const { sessionId, segmentId, mode: replayType } = allocation;
 
+      if (replayType === 'buffer' && (this.awaitingSnapshot || !events.some((event) => event?.type === 2))) {
+        this.status.droppedEvents += events.length;
+        this.outcome('dropped', 'snapshot_required');
+        return;
+      }
+      if (flushedBufferedHistory) this.awaitingSnapshot = true;
+
       if (!sessionId) {
+        this.outcome('dropped', 'missing_session');
         return;
       }
       if (pendingIdentity && (pendingIdentity.sessionId !== allocation.sessionId || pendingIdentity.userId !== allocation.userId)) {
+        this.outcome('dropped', 'identity_changed');
         return;
       }
 
       const safeEvents = sanitizeReplayEvents(events, { unmask: this.config.unmask, blockMedia: this.config.blockMedia });
-      if (safeEvents.length === 0 || !this.isCurrent(generation)) return;
+      if (safeEvents.length === 0 || !this.isCurrent(generation)) {
+        this.outcome('dropped', 'cancelled');
+        return;
+      }
+      if (safeEvents.length > this.config.maxChunkEvents) {
+        this.outcome('dropped', 'chunk_event_limit');
+        return;
+      }
 
       // Compress on main thread (sync -- sendBeacon requires sync data)
       const json = JSON.stringify(safeEvents);
       const encoded = new TextEncoder().encode(json);
       const compressed = gzipSync(encoded, { level: 6 });
+
+      if (compressed.byteLength > this.config.maxChunkBytes) {
+        this.outcome('dropped', 'chunk_byte_limit');
+        return;
+      }
 
       // Build URL with query parameters (sendBeacon cannot set custom headers)
       const replayUrl = sanitizeReplayUrl(this.urlFn ? this.urlFn() : '');
@@ -351,19 +606,26 @@ export class ReplayTransport {
       // Cast through ArrayBuffer to satisfy TypeScript 5.x Uint8Array<ArrayBufferLike> vs BlobPart
       const blob = new Blob([compressed as unknown as BlobPart], { type: 'application/octet-stream' });
 
-      if (!this.isCurrent(generation)) return;
+      if (!this.isCurrent(generation)) {
+        this.outcome('unknown', 'cancelled');
+        return;
+      }
 
       // Try sendBeacon first (works during page unload)
       if (compressed.byteLength <= BEACON_SIZE_LIMIT && typeof navigator !== 'undefined' && navigator.sendBeacon) {
         const sent = navigator.sendBeacon(url, blob);
         if (sent) {
+          this.outcome('unknown', 'beacon_queued');
           return;
         }
       }
 
       // Fallback: fetch with keepalive (also has ~64KB limit but is the standard approach)
       if (typeof fetch !== 'undefined') {
-        if (!this.isCurrent(generation)) return;
+        if (!this.isCurrent(generation)) {
+          this.outcome('unknown', 'cancelled');
+          return;
+        }
         fetch(url, {
           method: 'POST',
           headers: {
@@ -374,8 +636,12 @@ export class ReplayTransport {
         }).catch(() => {
           // Data loss accepted -- replay is non-critical
         });
+        this.outcome('unknown', 'beacon_fallback_queued');
+        return;
       }
+      this.outcome('dropped', 'beacon_unavailable');
     } catch {
+      this.outcome('dropped', 'flush_error');
       // Never crash the host app on tab close
     }
   }
@@ -387,7 +653,7 @@ export class ReplayTransport {
   /**
    * Upload compressed chunk via fetch with exponential backoff retry.
    * Retries up to 3 times with delays of 1s, 2s, 4s.
-   * Non-retryable status codes (400, 401, 413) abort immediately.
+   * Non-retryable status codes (400, 401, 409, 413) abort immediately.
    * On final failure: drop chunk silently.
    */
   private async uploadWithRetry(
@@ -396,46 +662,92 @@ export class ReplayTransport {
     originalSize: number,
     headers: Record<string, string>,
     generation: number,
-  ): Promise<void> {
+  ): Promise<{ state: 'acknowledged' | 'dropped' | 'unknown'; reason: string }> {
     const url = `${this.config.endpoint}/api/replays/${sessionId}/chunks`;
+    const startedAt = Date.now();
+    this.status.inflightPayloads++;
+    this.status.deliveryState = 'uploading';
+    this.inflightPayloadBytes += compressed.byteLength;
+    this.publish('upload_started');
+    const finish = (result: { state: 'acknowledged' | 'dropped' | 'unknown'; reason: string }) => {
+      this.status.inflightPayloads--;
+      this.inflightPayloadBytes -= compressed.byteLength;
+      this.status.deliveryState = this.activeCompressions > 0 ? 'uploading' : 'idle';
+      this.publish('upload_finished');
+      return result;
+    };
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      if (!this.isCurrent(generation)) return;
+      if (!this.isCurrent(generation)) {
+        return finish({ state: 'unknown', reason: 'cancelled' });
+      }
       const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
       if (controller) this.activeRequests.add(controller);
+      let timeout: ReturnType<typeof setTimeout> | null = null;
       try {
-        const response = await fetch(url, {
+        const request = fetch(url, {
           method: 'POST',
           headers: { ...headers, 'X-Original-Size': String(originalSize) },
           body: compressed as unknown as BodyInit,
           ...(controller ? { signal: controller.signal } : {}),
         });
-        if (!this.isCurrent(generation)) return;
+        if (controller) timeout = setTimeout(() => controller.abort(), this.config.fetchTimeoutMs);
+        const response = controller
+          ? await request
+          : await Promise.race([
+            request,
+            new Promise<Response>((_resolve, reject) => {
+              timeout = setTimeout(() => reject(new Error('Replay fetch timed out')), this.config.fetchTimeoutMs);
+            }),
+          ]);
+        if (!this.isCurrent(generation)) {
+          return finish({ state: 'unknown', reason: 'cancelled' });
+        }
 
         if (response.ok) {
-          return; // Success
+          return finish({ state: 'acknowledged', reason: 'acknowledged' });
         }
 
         // Non-retryable status codes -- abort immediately
-        if (response.status === 400 || response.status === 401 || response.status === 413) {
-          return;
+        if (response.status === 400 || response.status === 401 || response.status === 409 || response.status === 413) {
+          return finish({ state: 'dropped', reason: `http_${response.status}` });
         }
+
+        if (response.status === 429) this.publish('rate_limited');
 
         // Retryable failure -- wait before next attempt
         if (attempt < MAX_ATTEMPTS - 1) {
-          if (!(await this.delay(RETRY_DELAYS[attempt], generation))) return;
+          const retryAfter = response.status === 429 ? this.retryAfterMs(response) : RETRY_DELAYS[attempt];
+          const remaining = this.config.retryMaxAgeMs - (Date.now() - startedAt);
+          if (remaining <= 0 || !(await this.delay(Math.min(retryAfter, remaining), generation))) {
+            return finish({ state: 'dropped', reason: response.status === 429 ? 'rate_limit_expired' : 'retry_expired' });
+          }
         }
       } catch {
-        if (!this.isCurrent(generation)) return;
+        if (!this.isCurrent(generation)) {
+          return finish({ state: 'unknown', reason: 'cancelled' });
+        }
         // Network error -- wait before retry
         if (attempt < MAX_ATTEMPTS - 1) {
-          if (!(await this.delay(RETRY_DELAYS[attempt], generation))) return;
+          const remaining = this.config.retryMaxAgeMs - (Date.now() - startedAt);
+          if (remaining <= 0 || !(await this.delay(Math.min(RETRY_DELAYS[attempt], remaining), generation))) {
+            return finish({ state: 'dropped', reason: 'retry_expired' });
+          }
         }
       } finally {
+        if (timeout !== null) clearTimeout(timeout);
         if (controller) this.activeRequests.delete(controller);
       }
     }
 
     // All attempts exhausted -- drop chunk (replay data loss is acceptable)
+    return finish({ state: 'dropped', reason: 'retry_exhausted' });
+  }
+
+  private retryAfterMs(response: Response): number {
+    const value = response.headers.get('Retry-After');
+    const seconds = value === null ? NaN : Number(value);
+    if (!Number.isFinite(seconds) || seconds < 0) return RETRY_DELAYS[0];
+    return Math.min(seconds * 1000, this.config.retryMaxAgeMs);
   }
 
   /** Capture metadata before compression or retries can cross a session boundary. */

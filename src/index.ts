@@ -18,7 +18,7 @@
  * Manual control: start(), stop(), and flush() control the recording lifecycle.
  */
 
-import type { ReplayConfig, ResolvedReplayConfig, Integration } from './types';
+import type { ReplayConfig, ReplayStatus, ReplayStatusListener, ResolvedReplayConfig, Integration } from './types';
 import { resolveReplayConfig } from './config';
 import { record } from 'rrweb';
 import { startRecording } from './recorder';
@@ -35,7 +35,7 @@ import { sanitizeCustomEventPayload } from './privacy';
  */
 export function replayIntegration(
   config: ReplayConfig = {},
-): Integration & { start(): void; stop(): void; flush(): void; getSessionId(): string } {
+): Integration & { start(): void; stop(): void; flush(): void; getSessionId(): string; getStatus(): ReplayStatus; subscribeStatus(listener: ReplayStatusListener): () => void } {
   let session: SessionManager | null = null;
   let compressionWorker: CompressionWorker | null = null;
   let transport: ReplayTransport | null = null;
@@ -48,9 +48,10 @@ export function replayIntegration(
   let startRecordingPipeline: () => void = () => {};
   let stopRecordingPipeline: () => void = () => {};
   let installBreadcrumbBridge: () => void = () => {};
+  const statusSubscriptions = new Map<ReplayStatusListener, (() => void) | null>();
   const hostRecordingEnabled = (): boolean => clientRef?.getConfig?.().enabled !== false;
 
-  const integration: Integration & { start(): void; stop(): void; flush(): void; getSessionId(): string } = {
+  const integration: Integration & { start(): void; stop(): void; flush(): void; getSessionId(): string; getStatus(): ReplayStatus; subscribeStatus(listener: ReplayStatusListener): () => void } = {
     name: 'replay',
 
     /**
@@ -93,6 +94,7 @@ export function replayIntegration(
         startRecordingPipeline = () => {
           if (!hostRecordingEnabled() || manuallyStopped || !session || !resolvedConfig || !transport || !session.isActive() || !session.isVisible() || session.getMode() === 'off') return;
           if (stopRecording) return;
+          transport.expectSnapshot();
           transport!.startRecordingWindow();
           stopRecording = startRecording(resolvedConfig, (event, isCheckout) => {
             session?.onEvent(event, isCheckout);
@@ -254,6 +256,9 @@ export function replayIntegration(
             () => session!.allocateSegment(),
             () => session!.getIdentity(),
           );
+          for (const [listener, unsubscribe] of statusSubscriptions) {
+            if (!unsubscribe) statusSubscriptions.set(listener, transport.subscribeStatus(listener));
+          }
         };
 
         // Create compression worker and transport only after all gates pass.
@@ -279,6 +284,10 @@ export function replayIntegration(
           breadcrumbUnsubscribe = null;
         }
         stopRecordingPipeline();
+        for (const [listener, unsubscribe] of statusSubscriptions) {
+          unsubscribe?.();
+          statusSubscriptions.set(listener, null);
+        }
         transport?.destroy();
         compressionWorker?.destroy();
         transport = null;
@@ -304,6 +313,9 @@ export function replayIntegration(
           () => session!.getState().lastActivity + resolvedConfig!.idleTimeout,
           () => session!.allocateSegment(), () => session!.getIdentity(),
         );
+        for (const [listener, unsubscribe] of statusSubscriptions) {
+          if (!unsubscribe) statusSubscriptions.set(listener, transport.subscribeStatus(listener));
+        }
         startRecordingPipeline();
       } catch {
         manuallyStopped = true;
@@ -321,6 +333,10 @@ export function replayIntegration(
         if (breadcrumbUnsubscribe) breadcrumbUnsubscribe();
         breadcrumbUnsubscribe = null;
         stopRecordingPipeline();
+        for (const [listener, unsubscribe] of statusSubscriptions) {
+          unsubscribe?.();
+          statusSubscriptions.set(listener, null);
+        }
         transport?.destroy();
         compressionWorker?.destroy();
         restoreCaptureException?.();
@@ -357,10 +373,38 @@ export function replayIntegration(
     getSessionId(): string {
       return session?.getSessionId() ?? '';
     },
+
+    getStatus(): ReplayStatus {
+      return transport?.getStatus() ?? {
+        state: manuallyStopped ? 'stopped' : 'idle',
+        captureState: manuallyStopped ? 'stopped' : 'idle',
+        deliveryState: manuallyStopped ? 'stopped' : 'idle',
+        pendingBytes: 0,
+        pendingEvents: 0,
+        pendingChunks: 0,
+        inflightPayloads: 0,
+        inflightFetches: 0,
+        acknowledgedChunks: 0,
+        droppedChunks: 0,
+        droppedEvents: 0,
+        unknownChunks: 0,
+        lastReason: null,
+      };
+    },
+
+    subscribeStatus(listener: ReplayStatusListener): () => void {
+      const unsubscribe = transport ? transport.subscribeStatus(listener) : null;
+      statusSubscriptions.set(listener, unsubscribe);
+      if (!transport) listener(integration.getStatus());
+      return () => {
+        statusSubscriptions.get(listener)?.();
+        statusSubscriptions.delete(listener);
+      };
+    },
   };
 
   return integration;
 }
 
 // Re-export types for consumers
-export type { ReplayConfig, Integration } from './types';
+export type { ReplayConfig, Integration, ReplayStatus, ReplayStatusListener, ReplayCaptureState, ReplayDeliveryState } from './types';

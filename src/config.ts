@@ -15,6 +15,12 @@ const DEFAULTS = {
   idleTimeout: 1_800_000, // 30 minutes
   flushInterval: 30_000, // 30 seconds
   maxBufferSize: 24_117_248, // 23MB
+  maxBufferEvents: 10_000,
+  maxBufferAgeMs: 60_000,
+  maxChunkEvents: 5_000,
+  maxChunkBytes: 25 * 1024 * 1024,
+  fetchTimeoutMs: 10_000,
+  retryMaxAgeMs: 30_000,
   inlineImages: false,
   blockMedia: true,
 } as const;
@@ -23,6 +29,13 @@ const MIN_IDLE_TIMEOUT_MS = 1_000;
 const MAX_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const MAX_UNMASK_SELECTORS = 50;
 const MAX_UNMASK_SELECTOR_LENGTH = 256;
+const MAX_BUFFER_SIZE = 64 * 1024 * 1024;
+const MAX_BUFFER_EVENTS = 100_000;
+const MAX_BUFFER_AGE_MS = 30 * 60 * 1000;
+const MAX_CHUNK_EVENTS = 50_000;
+const MAX_CHUNK_BYTES = 25 * 1024 * 1024;
+const MAX_FETCH_TIMEOUT_MS = 60_000;
+const MAX_RETRY_AGE_MS = 5 * 60 * 1000;
 
 function resolveUnmask(value: string[] | undefined): string[] {
   if (!Array.isArray(value)) return DEFAULTS.unmask;
@@ -54,6 +67,10 @@ function resolveIdleTimeout(value: number | undefined): number {
  * Clamp a value to the [min, max] range, logging a warning if clamped.
  */
 function clampRate(value: number, name: string, min: number, max: number): number {
+  if (!Number.isFinite(value)) {
+    console.warn(`[TraceKit Replay] ${name} (${value}) is not finite, disabling this sample rate`);
+    return min;
+  }
   if (value < min) {
     console.warn(`[TraceKit Replay] ${name} (${value}) is below ${min}, clamping to ${min}`);
     return min;
@@ -63,6 +80,19 @@ function clampRate(value: number, name: string, min: number, max: number): numbe
     return max;
   }
   return value;
+}
+
+function resolvePositive(value: number | undefined, fallback: number, maximum: number, name: string): number {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value) || value <= 0) {
+    console.warn(`[TraceKit Replay] ${name} (${value}) is invalid, using ${fallback}`);
+    return fallback;
+  }
+  if (value > maximum) {
+    console.warn(`[TraceKit Replay] ${name} (${value}) exceeds ${maximum}, clamping`);
+    return maximum;
+  }
+  return Math.floor(value);
 }
 
 /**
@@ -104,7 +134,13 @@ export function resolveReplayConfig(
     unmask: resolveUnmask(config.unmask),
     idleTimeout: resolveIdleTimeout(config.idleTimeout),
     flushInterval: config.flushInterval ?? DEFAULTS.flushInterval,
-    maxBufferSize: config.maxBufferSize ?? DEFAULTS.maxBufferSize,
+    maxBufferSize: resolvePositive(config.maxBufferSize, DEFAULTS.maxBufferSize, MAX_BUFFER_SIZE, 'maxBufferSize'),
+    maxBufferEvents: resolvePositive(config.maxBufferEvents, DEFAULTS.maxBufferEvents, MAX_BUFFER_EVENTS, 'maxBufferEvents'),
+    maxBufferAgeMs: resolvePositive(config.maxBufferAgeMs, DEFAULTS.maxBufferAgeMs, MAX_BUFFER_AGE_MS, 'maxBufferAgeMs'),
+    maxChunkEvents: resolvePositive(config.maxChunkEvents, DEFAULTS.maxChunkEvents, MAX_CHUNK_EVENTS, 'maxChunkEvents'),
+    maxChunkBytes: resolvePositive(config.maxChunkBytes, DEFAULTS.maxChunkBytes, MAX_CHUNK_BYTES, 'maxChunkBytes'),
+    fetchTimeoutMs: resolvePositive(config.fetchTimeoutMs, DEFAULTS.fetchTimeoutMs, MAX_FETCH_TIMEOUT_MS, 'fetchTimeoutMs'),
+    retryMaxAgeMs: resolvePositive(config.retryMaxAgeMs, DEFAULTS.retryMaxAgeMs, MAX_RETRY_AGE_MS, 'retryMaxAgeMs'),
     inlineImages: config.inlineImages ?? DEFAULTS.inlineImages,
     blockMedia: config.blockMedia ?? DEFAULTS.blockMedia,
     serviceName: config.serviceName ?? serviceName,
