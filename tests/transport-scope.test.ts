@@ -64,4 +64,30 @@ describe('replay transport scope metadata', () => {
     expect((request.headers as Record<string, string>)['X-Replay-Service-Name']).toBeUndefined();
     transport.destroy();
   });
+
+  it('sends the configured service discriminator with sendBeacon uploads', () => {
+    const sendBeacon = vi.fn().mockReturnValue(true);
+    vi.stubGlobal('navigator', { sendBeacon, userAgent: '' });
+    const transport = startTransport('checkout');
+    transport.addEvent({ type: 2, timestamp: Date.now() });
+
+    transport.flushSync();
+
+    expect(sendBeacon).toHaveBeenCalledTimes(1);
+    const [url] = sendBeacon.mock.calls[0] as [string, Blob];
+    expect(url).toContain('replay_service_name=checkout');
+    transport.destroy();
+  });
+
+  it('omits ASCII control characters from both upload paths', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }));
+    const transport = startTransport('checkout\u0007');
+    transport.addEvent({ type: 2, timestamp: Date.now() });
+
+    await transport.flush();
+
+    const [, request] = vi.mocked(fetch).mock.calls[0];
+    expect((request.headers as Record<string, string>)['X-Replay-Service-Name']).toBeUndefined();
+    transport.destroy();
+  });
 });
