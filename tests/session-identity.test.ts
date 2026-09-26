@@ -17,8 +17,11 @@ const config = (serviceName = 'alpha', apiKey = 'public-key'): ResolvedReplayCon
 function storage(values = new Map<string, string>()) {
   return {
     values,
+    get length() { return values.size; },
+    key: vi.fn((index: number) => [...values.keys()][index] ?? null),
     getItem: vi.fn((key: string) => values.get(key) ?? null),
     setItem: vi.fn((key: string, value: string) => { values.set(key, value); }),
+    removeItem: vi.fn((key: string) => { values.delete(key); }),
   };
 }
 
@@ -134,6 +137,22 @@ describe('Replay session identity', () => {
     clone.destroy();
   });
 
+  it('rejects a delayed copy even when its counter matches the released owner', async () => {
+    const originalStorage = storage();
+    vi.stubGlobal('navigator', { locks: new FakeLocks() });
+    vi.stubGlobal('sessionStorage', originalStorage);
+    const first = await createManager();
+    expect(first.nextSegmentId()).toBe(0);
+    const originalId = first.getSessionId();
+    const delayedCopy = storage(new Map(originalStorage.values));
+    first.destroy();
+    vi.stubGlobal('sessionStorage', delayedCopy);
+    const clone = await createManager();
+    expect(clone.getSessionId()).not.toBe(originalId);
+    expect(clone.nextSegmentId()).toBe(0);
+    clone.destroy();
+  });
+
   it('uses fresh document identity when storage is blocked or ownership proof is absent', async () => {
     const blocked = { getItem: () => { throw new Error('blocked'); }, setItem: () => { throw new Error('blocked'); } };
     vi.stubGlobal('sessionStorage', blocked);
@@ -147,7 +166,7 @@ describe('Replay session identity', () => {
     one.destroy(); two.destroy();
   });
 
-  it('restores a valid counter only after the previous owner releases its lock', async () => {
+  it('restores a valid counter only after a verified reload and lock release', async () => {
     const shared = storage();
     vi.stubGlobal('sessionStorage', shared);
     vi.stubGlobal('navigator', { locks: new FakeLocks() });
@@ -155,10 +174,25 @@ describe('Replay session identity', () => {
     const id = first.getSessionId();
     first.nextSegmentId();
     first.destroy();
+    vi.stubGlobal('location', { href: 'https://example.test/replay' });
+    vi.stubGlobal('performance', { getEntriesByType: (name: string) => name === 'navigation' ? [{ type: 'reload', name: 'https://example.test/replay' }] : [] });
     const reload = await createManager();
     expect(reload.getSessionId()).toBe(id);
     expect(reload.nextSegmentId()).toBe(1);
     reload.destroy();
+  });
+
+  it('removes a retired counter after identity rotation', async () => {
+    const shared = storage();
+    const counters = storage();
+    vi.stubGlobal('sessionStorage', shared);
+    vi.stubGlobal('localStorage', counters);
+    vi.stubGlobal('navigator', { locks: new FakeLocks() });
+    const manager = await createManager();
+    const retiredKey = [...counters.values.keys()][0];
+    manager.rotateIdentity();
+    expect(counters.values.has(retiredKey)).toBe(false);
+    manager.destroy();
   });
 
   it('does not allocate a segment before ownership settles', async () => {
