@@ -49,6 +49,12 @@ try {
       });
       const firstID = await page.evaluate(() => window.replay.getSessionId());
       assert.ok(firstID, `${name}: real Browser client must start Replay`);
+      const backgroundTab = await browser.newPage();
+      await backgroundTab.goto(origin);
+      await backgroundTab.bringToFront();
+      const actuallyHidden = await page.evaluate(() => document.visibilityState === 'hidden');
+      await backgroundTab.close();
+      await page.bringToFront();
       await page.waitForTimeout(1400);
       assert.equal(await page.evaluate(() => window.replay.getSessionId()), '', `${name}: idle session ends`);
       assert.ok(uploads.length > before, `${name}: actual recorder uploads`);
@@ -63,6 +69,31 @@ try {
       await page.click('#action');
       await page.waitForTimeout(150);
       assert.equal(uploads.length, afterTeardown, `${name}: teardown stops capture`);
+      await page.evaluate(() => {
+        sessionStorage.removeItem('__rq0503_pagehide');
+        addEventListener('pagehide', () => sessionStorage.setItem('__rq0503_pagehide', 'yes'), { once: true });
+        addEventListener('pageshow', (event) => { window.__rq0503_bfcache = event.persisted; });
+      });
+      await page.goto(`${origin}/next`);
+      const pagehide = await page.evaluate(() => sessionStorage.getItem('__rq0503_pagehide') === 'yes');
+      await page.goBack();
+      const backForwardCache = await page.evaluate(() => window.__rq0503_bfcache === true);
+      const storageContext = await browser.newContext();
+      await storageContext.addInitScript(() => {
+        for (const name of ['localStorage', 'sessionStorage']) {
+          Object.defineProperty(window, name, { get() { throw new DOMException('Blocked', 'SecurityError'); } });
+        }
+      });
+      const blockedPage = await storageContext.newPage();
+      await blockedPage.goto(origin);
+      const blockedStorage = await blockedPage.evaluate(() => {
+        const addon = TraceKitReplay.replayIntegration({ sessionSampleRate: 1, flushInterval: 100 });
+        TraceKit.init({ apiKey: 'synthetic-project-key', endpoint: location.origin, addons: [addon] });
+        const id = addon.getSessionId();
+        addon.teardown();
+        return Boolean(id);
+      });
+      await storageContext.close();
       for (const upload of uploads.slice(before)) {
         const serialized = JSON.stringify(upload.events);
         assert.doesNotMatch(serialized, /private-form-canary|url-query-canary|fragment-canary/);
@@ -71,10 +102,12 @@ try {
         assert.equal(boundaries.length, 2);
         assert.ok(boundaries[1].timestamp - boundaries[0].timestamp <= 1000);
       }
-      outcomes.push({ engine: name, version: browser.version(), state: 'pass', uploads: uploads.length - before });
+      outcomes.push({ engine: name, version: browser.version(), state: 'pass', uploads: uploads.length - before,
+        backgroundTab: actuallyHidden, pagehide, backForwardCache, blockedStorage });
       await page.close();
     } finally { await browser.close(); }
   }
 } finally { await new Promise((resolve) => server.close(resolve)); }
 console.log(JSON.stringify({ outcomes, inspectedTransports: uploads.length }));
-if (outcomes.some((outcome) => outcome.state !== 'pass')) process.exitCode = 2;
+if (outcomes.some((outcome) => outcome.state !== 'pass' || full &&
+  (!outcome.backgroundTab || !outcome.pagehide || !outcome.backForwardCache || !outcome.blockedStorage))) process.exitCode = 2;
