@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { replayIntegration } from '../src/index';
+import { SessionManager } from '../src/session';
 
 const recorder = vi.hoisted(() => ({ starts: 0, stops: 0, emit: null as null | ((event: any, checkout: boolean) => void) }));
 vi.mock('../src/recorder', () => ({
@@ -90,6 +91,24 @@ describe('Replay privacy lifecycle', () => {
     expect(recorder.starts).toBe(0);
     expect(host.listeners.size).toBe(0);
     expect(replay.getSessionId()).toBe('');
+    replay.teardown?.();
+  });
+
+  it('ignores an old readiness rejection after a new start', async () => {
+    let rejectOld!: (error: Error) => void;
+    vi.spyOn(SessionManager.prototype, 'ready')
+      .mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectOld = reject; }))
+      .mockResolvedValue(undefined);
+    const host = client();
+    const replay = replayIntegration({ sessionSampleRate: 1 });
+    replay.install(host);
+    replay.stop();
+    replay.start();
+    await vi.waitFor(() => expect(recorder.starts).toBe(1));
+    const freshId = replay.getSessionId();
+    rejectOld(new Error('old readiness failure'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(replay.getSessionId()).toBe(freshId);
     replay.teardown?.();
   });
 
