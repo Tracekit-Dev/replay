@@ -43,7 +43,7 @@ async function createManager(resolved = config()) {
 
 describe('Replay session identity', () => {
   beforeEach(() => vi.stubGlobal('localStorage', storage()));
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
   it('namespaces persisted state by endpoint, service, and key digest without storing raw keys', async () => {
     const shared = storage();
@@ -193,6 +193,23 @@ describe('Replay session identity', () => {
     manager.rotateIdentity();
     expect(counters.values.has(retiredKey)).toBe(false);
     manager.destroy();
+  });
+
+  it('cleans expired counters while keeping live reload state', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    const counters = storage();
+    vi.stubGlobal('sessionStorage', storage());
+    vi.stubGlobal('localStorage', counters);
+    vi.stubGlobal('navigator', { locks: new FakeLocks() });
+    const first = await createManager();
+    const oldKey = [...counters.values.keys()][0];
+    first.destroy();
+    expect(counters.values.has(oldKey)).toBe(true);
+    vi.advanceTimersByTime(config().idleTimeout + 1);
+    const second = await createManager();
+    expect(counters.values.has(oldKey)).toBe(false);
+    second.destroy();
   });
 
   it('does not allocate a segment before ownership settles', async () => {
