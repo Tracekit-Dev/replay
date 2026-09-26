@@ -131,4 +131,38 @@ describe('transport identity attribution', () => {
     replay.destroy();
     manager.destroy();
   });
+
+  it('uploads old buffered data and the synchronous restarted snapshot separately', async () => {
+    vi.stubGlobal('document', new FakeDocument());
+    vi.stubGlobal('sessionStorage', storageMap());
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }));
+    let userId = 'user-a';
+    const manager = new SessionManager(config());
+    manager.setUserIdentityProvider(() => userId);
+    const replay = transport(manager);
+    manager.setFlushCallback(() => { void replay.flush(); });
+    const oldIdentity = manager.getIdentity();
+    replay.addEvent({ type: 3, timestamp: Date.now() });
+    manager.setRestartCallback(() => {
+      replay.addEvent({ type: 2, timestamp: Date.now() });
+    });
+
+    userId = 'user-b';
+    const newSessionId = manager.getSessionId();
+    await replay.flush();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const uploads = vi.mocked(fetch).mock.calls.map(([url, request]) => ({
+      url,
+      sessionId: String(url).split('/api/replays/')[1].split('/chunks')[0],
+      segmentId: (request.headers as Record<string, string>)['X-Segment-Id'],
+      userId: (request.headers as Record<string, string>)['X-Replay-User-Id'],
+    }));
+    expect(uploads).toContainEqual({ url: expect.stringContaining(oldIdentity.sessionId), sessionId: oldIdentity.sessionId, segmentId: '0', userId: 'user-a' });
+    expect(uploads).toContainEqual({ url: expect.stringContaining(newSessionId), sessionId: newSessionId, segmentId: '0', userId: 'user-b' });
+    expect(newSessionId).not.toBe(oldIdentity.sessionId);
+    replay.destroy();
+    manager.destroy();
+  });
 });

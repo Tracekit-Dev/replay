@@ -496,6 +496,11 @@ export class SessionManager {
       this.ringBuffer.clear();
       persistSession(this.state, this.config, this.ownerToken);
       if (this.active) this.resetIdleTimer();
+
+      // The old user marker applies only to the synchronous flush above.
+      // Clear it before the restarted recorder can emit new events.
+      this.rotatingUserId = null;
+
       if (this.active && this.state.mode !== 'off' && this.restartCallback) {
         try { this.restartCallback(); } catch { /* Never crash the host app */ }
       }
