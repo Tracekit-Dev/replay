@@ -180,6 +180,16 @@ export class ReplayTransport {
     }
   }
 
+  /** Require a fresh snapshot before the next session region can upload. */
+  expectSnapshot(): void {
+    this.awaitingSnapshot = true;
+    this.retainedBufferHistory = false;
+    this.pendingRegionHadSnapshot = false;
+    this.pendingEvents = [];
+    this.bufferSize = 0;
+    this.publish('snapshot_required');
+  }
+
   /**
    * Destroy the transport: stop + clear all pending events.
    */

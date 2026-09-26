@@ -172,6 +172,7 @@ describe('bounded replay queues', () => {
     const transport = new ReplayTransport(config, worker as any);
     transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
     transport.stop();
+    transport.expectSnapshot();
     startRecording(config, (event) => transport.addEvent(event));
     const emit = (record as any).mock.calls.at(-1)[0].emit;
     emit({ type: 2, timestamp: Date.now(), data: { node: null } }, false);

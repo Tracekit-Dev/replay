@@ -94,6 +94,7 @@ export function replayIntegration(
         startRecordingPipeline = () => {
           if (!hostRecordingEnabled() || manuallyStopped || !session || !resolvedConfig || !transport || !session.isActive() || !session.isVisible() || session.getMode() === 'off') return;
           if (stopRecording) return;
+          transport.expectSnapshot();
           transport!.startRecordingWindow();
           stopRecording = startRecording(resolvedConfig, (event, isCheckout) => {
             session?.onEvent(event, isCheckout);
