@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import * as oldest from '../node_modules/@tracekit/browser/dist/index.js';
+import * as oldest from '../node_modules/@tracekit/browser-oldest/dist/index.js';
 import * as current from '../../browser/dist/index.js';
 import { replayIntegration } from '../dist/index.js';
 
@@ -9,7 +9,7 @@ async function packageVersion(path) {
 }
 
 async function checkActualBundles() {
-  const oldestVersion = await packageVersion('../node_modules/@tracekit/browser/package.json');
+  const oldestVersion = await packageVersion('../node_modules/@tracekit/browser-oldest/package.json');
   const currentVersion = await packageVersion('../../browser/package.json');
   assert.equal(oldestVersion, '0.1.1', 'the installed oldest bundle must be the declared peer minimum');
 

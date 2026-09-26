@@ -36,6 +36,7 @@
   },
   "devDependencies": {
     "@tracekit/browser": "^0.2.0",
+    "@tracekit/browser-oldest": "npm:@tracekit/browser@0.1.1",
     "happy-dom": "20.14.5",
     "tsup": "^8.0.0",
     "typescript": "^5.3.0",

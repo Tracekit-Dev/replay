@@ -80,13 +80,20 @@ describe('serialized privacy upload paths', () => {
     const safe = sanitizeReplayEvent(secretEvent);
     expect(safe).not.toBeNull();
     try { safe.data.payload.message = 'synthetic-mutated-canary'; } catch { /* Frozen graphs may reject writes. */ }
+    const safeSnapshot = sanitizeReplayEvent({ type: 2, timestamp: 101, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+      { type: 2, id: 2, tagName: 'div', attributes: { class: canary }, childNodes: [] },
+    ] } } });
+    expect(Object.isFrozen(safeSnapshot.data.node.childNodes[0].attributes)).toBe(true);
+    try { safeSnapshot.data.node.childNodes[0].attributes.class = 'synthetic-mutated-canary'; } catch { /* Frozen graphs may reject writes. */ }
     const calls: RequestInit[] = [];
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => { calls.push(init); return { ok: true }; }));
     const instance = transport();
     instance.addEvent(safe);
+    instance.addEvent(safeSnapshot);
     await instance.flush();
     expect(calls).toHaveLength(1);
     expect(decode(calls[0].body as Uint8Array)).not.toContain('synthetic-mutated-canary');
+    expect(decode(calls[0].body as Uint8Array)).not.toContain(canary);
     instance.destroy();
   });
 
