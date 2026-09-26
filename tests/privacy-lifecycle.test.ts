@@ -152,6 +152,17 @@ describe('Replay privacy lifecycle', () => {
     replay.teardown?.();
   });
 
+  it('does not add an unremovable replay tag on an older Browser scope', async () => {
+    const host = client(true, false, false);
+    delete (host.scope as { removeTag?: (name: string) => void }).removeTag;
+    const replay = replayIntegration({ sessionSampleRate: 1 });
+    replay.install(host);
+    await vi.waitFor(() => expect(recorder.starts).toBe(1));
+    host.captureException(new Error('synthetic'));
+    expect(host.tags.has('replay_id')).toBe(false);
+    replay.teardown?.();
+  });
+
   it('reinitializes without retaining a second recorder or changing the host error method', async () => {
     const firstHost = client();
     const first = replayIntegration({ sessionSampleRate: 1 });
