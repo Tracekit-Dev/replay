@@ -142,6 +142,25 @@ describe('bounded replay queues', () => {
     transport.destroy();
   });
 
+  it('blocks mutations after privacy rejects a session baseline', async () => {
+    const worker = { compress: vi.fn(async (events: any[]) => ({ compressed: new Uint8Array([1]), originalSize: events.length })) };
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 202 })));
+    const transport = new ReplayTransport(resolveReplayConfig({}, 'privacy-baseline', 'https://example.test'), worker as any);
+    transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent({ type: 2, timestamp: Date.now(), node: null });
+    transport.addEvent({ type: 3, timestamp: Date.now() + 1, data: { source: 2, type: 2 } });
+    await transport.flush();
+    expect(worker.compress).not.toHaveBeenCalled();
+    expect(transport.getStatus().droppedEvents).toBeGreaterThan(0);
+
+    transport.addEvent({ type: 2, timestamp: Date.now() + 2, data: { node: { type: 1, tagName: 'main' } } });
+    transport.addEvent({ type: 3, timestamp: Date.now() + 3, data: { source: 2, type: 2 } });
+    await transport.flush();
+    expect(worker.compress).toHaveBeenCalledTimes(1);
+    transport.destroy();
+  });
+
   it('stops an oversized baseline region until a fresh snapshot arrives', () => {
     const worker = { compress: vi.fn() };
     const transport = new ReplayTransport(resolveReplayConfig({ maxBufferSize: 128 }, 'key', 'https://example.test'), worker as any);
