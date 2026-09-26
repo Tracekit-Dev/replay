@@ -114,6 +114,25 @@ describe('Replay session identity', () => {
     one.destroy(); two.destroy();
   });
 
+  it('rejects a delayed copy after the first owner releases a newer counter', async () => {
+    const originalStorage = storage();
+    const sharedCounter = storage();
+    vi.stubGlobal('navigator', { locks: new FakeLocks() });
+    vi.stubGlobal('localStorage', sharedCounter);
+    vi.stubGlobal('sessionStorage', originalStorage);
+    const first = await createManager();
+    const firstId = first.getSessionId();
+    const delayedCopy = storage(new Map(originalStorage.values));
+    expect(first.nextSegmentId()).toBe(0);
+    first.destroy();
+    vi.stubGlobal('sessionStorage', delayedCopy);
+    const clone = await createManager();
+    const cloneId = clone.getSessionId();
+    const cloneSegment = clone.nextSegmentId();
+    expect(cloneId !== firstId || cloneSegment > 0).toBe(true);
+    clone.destroy();
+  });
+
   it('uses fresh document identity when storage is blocked or ownership proof is absent', async () => {
     const blocked = { getItem: () => { throw new Error('blocked'); }, setItem: () => { throw new Error('blocked'); } };
     vi.stubGlobal('sessionStorage', blocked);
@@ -186,6 +205,27 @@ describe('Replay session identity', () => {
     client.captureException(new Error('synthetic'));
     expect(integration.getSessionId()).not.toBe(firstId);
     expect(recorderCalls.count).toBeGreaterThanOrEqual(2);
+    integration.teardown?.();
+  });
+
+  it('keeps the initial automatic pageview linked to the identity that records', async () => {
+    vi.stubGlobal('sessionStorage', storage());
+    vi.stubGlobal('localStorage', storage());
+    vi.stubGlobal('navigator', { locks: new FakeLocks() });
+    const scope = { getUser: () => null, setTag: vi.fn(), onBreadcrumb: vi.fn() };
+    const client = {
+      getConfig: () => ({ apiKey: 'public-key', endpoint: 'https://example.test', serviceName: 'alpha' }),
+      getScope: () => scope,
+      captureException: vi.fn(() => 'event-id'),
+    };
+    const integration = replayIntegration({ sessionSampleRate: 1 });
+    const previousRecorderCalls = recorderCalls.count;
+    integration.install(client);
+    // BrowserClient calls this synchronously after addon.install().
+    const initialPageviewReplayId = integration.getSessionId();
+    expect(initialPageviewReplayId).toMatch(/^[0-9a-f]{32}$/);
+    await vi.waitFor(() => expect(recorderCalls.count).toBeGreaterThan(previousRecorderCalls));
+    expect(integration.getSessionId()).toBe(initialPageviewReplayId);
     integration.teardown?.();
   });
 });
