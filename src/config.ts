@@ -17,12 +17,40 @@ const DEFAULTS = {
   idleTimeout: 1_800_000, // 30 minutes
   flushInterval: 30_000, // 30 seconds
   maxBufferSize: 24_117_248, // 23MB
+  maxEventCount: 10_000,
+  maxBufferAgeMs: 120_000,
+  maxChunkCount: 4,
+  compressionTimeoutMs: 5_000,
+  fetchTimeoutMs: 10_000,
+  maxRetryAttempts: 3,
+  maxRetryAgeMs: 30_000,
+  retryBaseDelayMs: 1_000,
+  maxBackoffMs: 8_000,
   inlineImages: false,
   blockMedia: true,
 } as const;
 
 const MIN_IDLE_TIMEOUT_MS = 1_000;
 const MAX_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const CEILINGS = {
+  flushInterval: 60_000,
+  maxBufferSize: 24 * 1024 * 1024,
+  maxEventCount: 20_000,
+  maxBufferAgeMs: 5 * 60_000,
+  maxChunkCount: 8,
+  compressionTimeoutMs: 15_000,
+  fetchTimeoutMs: 30_000,
+  maxRetryAttempts: 5,
+  maxRetryAgeMs: 120_000,
+  retryBaseDelayMs: 5_000,
+  maxBackoffMs: 30_000,
+} as const;
+
+function boundedPositive(value: number | undefined, fallback: number, ceiling: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.max(1, Math.min(Math.floor(value), ceiling));
+}
 
 function resolveIdleTimeout(value: number | undefined): number {
   if (value === undefined) return DEFAULTS.idleTimeout;
@@ -44,8 +72,8 @@ function resolveIdleTimeout(value: number | undefined): number {
 /**
  * Clamp a value to the [min, max] range, logging a warning if clamped.
  */
-function clampRate(value: number, name: string, min: number, max: number): number {
-  if (!Number.isFinite(value)) return min;
+function clampRate(value: number, name: string, min: number, max: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
   if (value < min) {
     console.warn(`[TraceKit Replay] ${name} (${value}) is below ${min}, clamping to ${min}`);
     return min;
@@ -82,6 +110,7 @@ export function resolveReplayConfig(
     'sessionSampleRate',
     0,
     1,
+    DEFAULTS.sessionSampleRate,
   );
 
   let errorSampleRate = clampRate(
@@ -89,6 +118,7 @@ export function resolveReplayConfig(
     'errorSampleRate',
     0,
     1,
+    DEFAULTS.errorSampleRate,
   );
 
   // Ensure combined rate does not exceed 1.0
@@ -106,8 +136,17 @@ export function resolveReplayConfig(
     block: (config.block ?? DEFAULTS.block).every(validSelector) ? [...(config.block ?? DEFAULTS.block)] : ['*'],
     mask: (config.mask ?? DEFAULTS.mask).every(validSelector) ? [...(config.mask ?? DEFAULTS.mask)] : ['*'],
     idleTimeout: resolveIdleTimeout(config.idleTimeout),
-    flushInterval: config.flushInterval ?? DEFAULTS.flushInterval,
-    maxBufferSize: config.maxBufferSize ?? DEFAULTS.maxBufferSize,
+    flushInterval: boundedPositive(config.flushInterval, DEFAULTS.flushInterval, CEILINGS.flushInterval),
+    maxBufferSize: boundedPositive(config.maxBufferSize, DEFAULTS.maxBufferSize, CEILINGS.maxBufferSize),
+    maxEventCount: boundedPositive(config.maxEventCount, DEFAULTS.maxEventCount, CEILINGS.maxEventCount),
+    maxBufferAgeMs: boundedPositive(config.maxBufferAgeMs, DEFAULTS.maxBufferAgeMs, CEILINGS.maxBufferAgeMs),
+    maxChunkCount: boundedPositive(config.maxChunkCount, DEFAULTS.maxChunkCount, CEILINGS.maxChunkCount),
+    compressionTimeoutMs: boundedPositive(config.compressionTimeoutMs, DEFAULTS.compressionTimeoutMs, CEILINGS.compressionTimeoutMs),
+    fetchTimeoutMs: boundedPositive(config.fetchTimeoutMs, DEFAULTS.fetchTimeoutMs, CEILINGS.fetchTimeoutMs),
+    maxRetryAttempts: boundedPositive(config.maxRetryAttempts, DEFAULTS.maxRetryAttempts, CEILINGS.maxRetryAttempts),
+    maxRetryAgeMs: boundedPositive(config.maxRetryAgeMs, DEFAULTS.maxRetryAgeMs, CEILINGS.maxRetryAgeMs),
+    retryBaseDelayMs: boundedPositive(config.retryBaseDelayMs, DEFAULTS.retryBaseDelayMs, CEILINGS.retryBaseDelayMs),
+    maxBackoffMs: boundedPositive(config.maxBackoffMs, DEFAULTS.maxBackoffMs, CEILINGS.maxBackoffMs),
     inlineImages: config.inlineImages ?? DEFAULTS.inlineImages,
     blockMedia: config.blockMedia ?? DEFAULTS.blockMedia,
     apiKey,

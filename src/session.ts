@@ -68,6 +68,7 @@ export class SessionManager {
   private pauseCallback: (() => void) | null = null;
   private resumeCallback: (() => void) | null = null;
   private idleStopCallback: (() => void) | null = null;
+  private queueFailureCallback: (() => void) | null = null;
   private activityHandlers: Array<[string, (event: Event) => void]> = [];
   private active = true;
   private destroyed = false;
@@ -80,7 +81,7 @@ export class SessionManager {
 
   constructor(config: ResolvedReplayConfig) {
     this.config = config;
-    this.ringBuffer = new RingBuffer(60_000);
+    this.ringBuffer = new RingBuffer(60_000, { maxBytes: Math.min(4 * 1024 * 1024, config.maxBufferSize) });
 
     const now = Date.now();
 
@@ -130,7 +131,7 @@ export class SessionManager {
         }
       }
     } else if (this.state.mode === 'buffer') {
-      this.ringBuffer.add(event);
+      if (this.ringBuffer.add(event) === 'snapshot_too_large') this.queueFailureCallback?.();
     }
     // mode === 'off': discard
   }
@@ -181,6 +182,12 @@ export class SessionManager {
   setEventCallback(cb: (events: any[]) => void): void {
     this.eventCallback = cb;
   }
+
+  /** Report a baseline that cannot fit the bounded error history. */
+  setQueueFailureCallback(cb: () => void): void { this.queueFailureCallback = cb; }
+
+  getRetainedBytes(): number { return this.ringBuffer.byteSize; }
+  getRetainedEventCount(): number { return this.ringBuffer.size; }
 
   /** Set callback called on idle timeout to flush pending events */
   setFlushCallback(cb: () => void): void {

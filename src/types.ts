@@ -24,6 +24,29 @@ export interface ReplayIntegration extends Integration {
   stop(): void;
   flush(): void;
   getSessionId(): string;
+  getStatus(): ReplayStatus;
+  subscribeStatus(listener: (status: ReplayStatus) => void): () => void;
+}
+
+/** Aggregate diagnostics only. Never add URLs, identities, or recorded content. */
+export interface ReplayStatus {
+  captureState: 'recording' | 'buffering' | 'paused' | 'stopped' | 'disabled' | 'sampled_out' | 'failed';
+  deliveryState: 'idle' | 'pending' | 'retrying' | 'degraded';
+  reason: 'none' | 'snapshot_too_large' | 'queue_limit' | 'compression_failed' | 'compression_timeout' |
+    'fetch_timeout' | 'retry_exhausted' | 'terminal_response' | 'beacon_unknown' | 'invalid_scope' |
+    'missing_identity' | 'privacy_stop';
+  queueBytes: number;
+  queueEvents: number;
+  queueChunks: number;
+  acceptedEvents: number;
+  acknowledgedChunks: number;
+  queuedBeacons: number;
+  retries: number;
+  droppedEvents: number;
+  droppedBytes: number;
+  droppedChunks: number;
+  lastAcknowledgedAt: number | null;
+  compressionMode: 'worker' | 'fallback' | 'unknown';
 }
 
 // ============================================================================
@@ -56,6 +79,33 @@ export interface ReplayConfig {
   /** Max buffer size in bytes (default: 24117248 = 23MB) */
   maxBufferSize?: number;
 
+  /** Max retained rrweb events across pending delivery work (default: 10000). */
+  maxEventCount?: number;
+
+  /** Max pending event age in milliseconds (default: 120000). */
+  maxBufferAgeMs?: number;
+
+  /** Max retained delivery chunks (default: 4). */
+  maxChunkCount?: number;
+
+  /** Compression deadline in milliseconds (default: 5000). */
+  compressionTimeoutMs?: number;
+
+  /** Fetch deadline in milliseconds (default: 10000). */
+  fetchTimeoutMs?: number;
+
+  /** Maximum fetch attempts for one immutable chunk (default: 3). */
+  maxRetryAttempts?: number;
+
+  /** Maximum retry lifetime in milliseconds (default: 30000). */
+  maxRetryAgeMs?: number;
+
+  /** Initial retry delay in milliseconds (default: 1000). */
+  retryBaseDelayMs?: number;
+
+  /** Maximum retry delay in milliseconds (default: 8000). */
+  maxBackoffMs?: number;
+
   /**
    * Inline images as base64 data URIs in the recording.
    * When true, images are captured and available during replay.
@@ -82,6 +132,15 @@ export interface ResolvedReplayConfig {
   idleTimeout: number;
   flushInterval: number;
   maxBufferSize: number;
+  maxEventCount: number;
+  maxBufferAgeMs: number;
+  maxChunkCount: number;
+  compressionTimeoutMs: number;
+  fetchTimeoutMs: number;
+  maxRetryAttempts: number;
+  maxRetryAgeMs: number;
+  retryBaseDelayMs: number;
+  maxBackoffMs: number;
   inlineImages: boolean;
   blockMedia: boolean;
   /** Inherited from BrowserClient */

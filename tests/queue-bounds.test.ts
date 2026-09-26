@@ -73,12 +73,15 @@ describe('bounded delivery', () => {
     vi.stubGlobal('fetch', fetchMock);
     const config = resolveReplayConfig({ maxBufferSize: 256, maxEventCount: 10 }, 'key', 'https://api.test');
     const transport = new ReplayTransport(config, { compress } as any);
+    const failed = vi.fn();
+    transport.setFailureCallback(failed);
     transport.start(() => 'a'.repeat(32), () => 0, () => 'session', () => '', () => '');
     transport.stop();
     transport.addEvent(snapshot(Date.now(), 'x'.repeat(1000)));
     await transport.flush();
     expect(transport.getStatus().captureState).toBe('failed');
     expect(transport.getStatus().reason).toBe('snapshot_too_large');
+    expect(failed).toHaveBeenCalledOnce();
     expect(compress).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
     transport.destroy();

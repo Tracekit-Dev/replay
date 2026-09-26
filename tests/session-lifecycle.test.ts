@@ -57,6 +57,18 @@ describe('SessionManager lifecycle', () => {
 
   const useLocks = () => vi.stubGlobal('navigator', { locks: new FakeLocks() });
 
+  it('reports oversized error-buffer baseline with zero retained bytes', () => {
+    vi.stubGlobal('document', doc);
+    const manager = new SessionManager({ ...config(), sessionSampleRate: 0, errorSampleRate: 1, maxBufferSize: 256 });
+    const failed = vi.fn();
+    manager.setQueueFailureCallback(failed);
+    manager.onEvent({ type: 2, timestamp: Date.now(), data: { node: { type: 0, id: 1, childNodes: [], text: 'x'.repeat(1000) } } }, false);
+    expect(failed).toHaveBeenCalledOnce();
+    expect(manager.getRetainedBytes()).toBe(0);
+    expect(manager.getRetainedEventCount()).toBe(0);
+    manager.destroy();
+  });
+
   it('expires after 30 minutes despite rrweb DOM and custom events for 800 minutes', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);

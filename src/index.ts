@@ -1,5 +1,5 @@
 /** Privacy-gated Replay integration for @tracekit/browser. */
-import type { ReplayConfig, ResolvedReplayConfig, ReplayIntegration } from './types';
+import type { ReplayConfig, ReplayStatus, ResolvedReplayConfig, ReplayIntegration } from './types';
 import { resolveReplayConfig } from './config';
 import { record } from 'rrweb';
 import { startRecording } from './recorder';
@@ -22,6 +22,33 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
   let manuallyStopped = false;
   let missingBreadcrumbReported = false;
   let recorderFailureReported = false;
+  let statusUnsubscribe: (() => void) | null = null;
+  const statusListeners = new Set<(status: ReplayStatus) => void>();
+  let lastStatus: ReplayStatus | null = null;
+
+  const getStatus = (): ReplayStatus => {
+    const transportStatus = transport?.getStatus() ?? lastStatus;
+    const state = session?.getMode();
+    const captureState: ReplayStatus['captureState'] = manuallyStopped ? 'stopped' : !client || !enabled() ? 'disabled' :
+      transportStatus?.captureState === 'failed' ? 'failed' :
+      !session ? 'failed' : state === 'off' ? 'sampled_out' : !session.isVisible() ? 'paused' :
+      state === 'buffer' ? 'buffering' : 'recording';
+    return { ...transportStatus ?? {
+      deliveryState: 'idle', reason: 'none', queueBytes: 0, queueEvents: 0, queueChunks: 0,
+      acceptedEvents: 0, acknowledgedChunks: 0, queuedBeacons: 0, retries: 0,
+      droppedEvents: 0, droppedBytes: 0, droppedChunks: 0, lastAcknowledgedAt: null,
+      compressionMode: 'unknown',
+    }, captureState,
+      queueBytes: (transportStatus?.queueBytes ?? 0) + (session?.getRetainedBytes() ?? 0),
+      queueEvents: (transportStatus?.queueEvents ?? 0) + (session?.getRetainedEventCount() ?? 0),
+    };
+  };
+  const emitStatus = () => {
+    const status = getStatus();
+    for (const listener of statusListeners) {
+      try { listener(status); } catch { /* Diagnostics stay isolated. */ }
+    }
+  };
 
   const enabled = () => {
     try { return client?.getConfig()?.enabled !== false; }
@@ -54,12 +81,16 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
     generation++;
     closeRecorder();
     removeOwnedBridge();
+    lastStatus = transport?.getStatus() ?? lastStatus;
+    statusUnsubscribe?.();
+    statusUnsubscribe = null;
     transport?.destroy();
     worker?.destroy();
     session?.destroy();
     transport = null;
     worker = null;
     session = null;
+    emitStatus();
   };
 
   const activate = () => {
@@ -83,6 +114,14 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
       try {
           worker = new CompressionWorker();
           transport = new ReplayTransport(replayConfig, worker);
+          statusUnsubscribe = transport.subscribeStatus(emitStatus);
+          transport.setSnapshotRequest(() => {
+            if (!current(token) || !stopRecorder) return;
+            try { record.takeFullSnapshot(); } catch { /* Capture stays isolated. */ }
+          });
+          transport.setFailureCallback(() => {
+            queueMicrotask(() => { if (current(token)) discard(); });
+          });
           let recordingUserId = currentUserId();
           let rotatingUser = false;
 
@@ -120,6 +159,11 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
           ownedSession.setEventCallback((events) => {
             if (!current(token)) return;
             for (const event of events) transport?.addEvent(event);
+          });
+          ownedSession.setQueueFailureCallback(() => {
+            if (!current(token)) return;
+            transport?.failSnapshotTooLarge();
+            discard();
           });
           ownedSession.setFlushCallback(() => { if (current(token)) void transport?.flush().catch(() => {}); });
           ownedSession.setRestartCallback(() => { if (current(token)) { closeRecorder(); beginRecorder(); } });
@@ -190,6 +234,7 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
             () => ownedSession.getState().lastActivity + replayConfig.idleTimeout,
           );
           beginRecorder();
+          emitStatus();
         } catch (error) {
           if (token !== generation || session !== ownedSession) return;
           console.warn('[TraceKit Replay] Failed to initialize replay recording:', error);
@@ -229,6 +274,12 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
     },
     getSessionId(): string {
       return !manuallyStopped && enabled() ? session?.getPageviewSessionId() ?? '' : '';
+    },
+    getStatus,
+    subscribeStatus(listener: (status: ReplayStatus) => void): () => void {
+      statusListeners.add(listener);
+      try { listener(getStatus()); } catch { /* Diagnostics stay isolated. */ }
+      return () => { statusListeners.delete(listener); };
     },
   };
   return integration;
