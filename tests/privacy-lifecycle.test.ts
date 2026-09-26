@@ -48,6 +48,9 @@ describe('Replay privacy lifecycle', () => {
     vi.stubGlobal('crypto', undefined);
     const fetchMock = vi.fn();
     const beacon = vi.fn(() => true);
+    const storageRead = vi.fn();
+    vi.stubGlobal('sessionStorage', { getItem: storageRead });
+    vi.stubGlobal('localStorage', { getItem: storageRead });
     vi.stubGlobal('fetch', fetchMock);
     vi.stubGlobal('navigator', { sendBeacon: beacon });
     const blobUrl = vi.spyOn(URL, 'createObjectURL');
@@ -68,6 +71,7 @@ describe('Replay privacy lifecycle', () => {
     expect(host.listeners.size).toBe(0);
     expect(host.captureException).toBe(host.original);
     expect(vi.getTimerCount()).toBe(0);
+    expect(storageRead).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(100);
     replay.flush();
     expect(replay.getSessionId()).toBe('');
@@ -83,6 +87,42 @@ describe('Replay privacy lifecycle', () => {
     expect(vi.getTimerCount()).toBe(0);
     expect(host.listeners.size).toBe(0);
     expect(host.captureException).toBe(host.original);
+  });
+
+  it('keeps a valid hidden session eligible for visibility resume', () => {
+    const listeners = new Map<string, Set<() => void>>();
+    const doc = {
+      visibilityState: 'hidden',
+      addEventListener(name: string, listener: () => void) {
+        const group = listeners.get(name) ?? new Set();
+        group.add(listener);
+        listeners.set(name, group);
+      },
+      removeEventListener(name: string, listener: () => void) { listeners.get(name)?.delete(listener); },
+    };
+    vi.stubGlobal('document', doc);
+    const host = client();
+    const replay = replayIntegration({ sessionSampleRate: 1 });
+    replay.install(host);
+    expect(recorder.starts).toBe(0);
+    expect(replay.getSessionId()).toBe('');
+    expect(host.listeners.size).toBe(1);
+    doc.visibilityState = 'visible';
+    for (const listener of listeners.get('visibilitychange') ?? []) listener();
+    expect(recorder.starts).toBe(1);
+    expect(replay.getSessionId()).toMatch(/^[0-9a-f]{32}$/);
+    replay.teardown?.();
+  });
+
+  it('keeps a sampled-out identity without starting a recorder', () => {
+    const host = client();
+    const replay = replayIntegration({ sessionSampleRate: 0, errorSampleRate: 0 });
+    replay.install(host);
+    expect(replay.getSessionId()).toBe('');
+    expect(recorder.starts).toBe(0);
+    expect(host.listeners.size).toBe(1);
+    replay.teardown?.();
+    expect(host.listeners.size).toBe(0);
   });
 
   it('discards every resource when rrweb returns no recorder and permits a clean explicit start', async () => {

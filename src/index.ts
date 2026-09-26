@@ -73,6 +73,11 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
       // Allocate synchronously. Browser's initial pageview reads this ID after install().
       const ownedSession = new SessionManager(replayConfig);
       session = ownedSession;
+      // Hidden and sampled-out sessions still have an identity. Only crypto failure has none.
+      if (!ownedSession.getState().sessionId) {
+        discard();
+        return;
+      }
       try {
           worker = new CompressionWorker();
           transport = new ReplayTransport(replayConfig, worker);
