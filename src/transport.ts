@@ -29,7 +29,7 @@ const BEACON_SIZE_LIMIT = 65536;
 function boundedServiceName(name: string | undefined): string | null {
   if (name === undefined || name === '') return '';
   const value = name.trim();
-  if (!value || new TextEncoder().encode(value).byteLength > 255 || /[\u0000-\u001f\u007f]/.test(value)) {
+  if (!value || new TextEncoder().encode(value).byteLength > 255 || /\p{Cc}/u.test(value)) {
     return null;
   }
   return value;
