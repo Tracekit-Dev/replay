@@ -148,7 +148,7 @@ describe('bounded replay queues', () => {
     const transport = new ReplayTransport(resolveReplayConfig({}, 'privacy-baseline', 'https://example.test'), worker as any);
     transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
     transport.stop();
-    transport.addEvent({ type: 2, timestamp: Date.now(), node: null });
+    transport.addEvent({ type: 2, timestamp: Date.now(), data: { node: null } });
     transport.addEvent({ type: 3, timestamp: Date.now() + 1, data: { source: 2, type: 2 } });
     await transport.flush();
     expect(worker.compress).not.toHaveBeenCalled();
