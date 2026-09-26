@@ -63,10 +63,12 @@ describe('transport identity attribution', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }));
     const first = new SessionManager(config());
     const replay = transport(first);
+    first.setFlushCallback(() => { void replay.flush(); });
     replay.addEvent({ type: 3, timestamp: Date.now() });
     const competing = new SessionManager(config());
 
     await replay.flush();
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(fetch).not.toHaveBeenCalled();
     replay.destroy();
@@ -82,13 +84,50 @@ describe('transport identity attribution', () => {
     const manager = new SessionManager(config());
     manager.setUserIdentityProvider(() => userId);
     const replay = transport(manager);
+    manager.setFlushCallback(() => { void replay.flush(); });
+    const oldIdentity = manager.getIdentity();
     replay.addEvent({ type: 3, timestamp: Date.now() });
     userId = 'user-b';
     manager.getSessionId();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await replay.flush();
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, request] = vi.mocked(fetch).mock.calls[0];
+    expect(url).toContain(`/api/replays/${oldIdentity.sessionId}/chunks`);
+    expect((request.headers as Record<string, string>)['X-Segment-Id']).toBe('0');
+    expect((request.headers as Record<string, string>)['X-Replay-User-Id']).toBe('user-a');
+    replay.destroy();
+    manager.destroy();
+  });
+
+  it('freezes the allocated session, segment, and user values for upload', async () => {
+    vi.stubGlobal('document', new FakeDocument());
+    vi.stubGlobal('sessionStorage', storageMap());
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }));
+    let userId = 'user-a';
+    const manager = new SessionManager(config());
+    manager.setUserIdentityProvider(() => userId);
+    const replay = transport(manager);
+    const identity = manager.getIdentity();
+    replay.addEvent({ type: 3, timestamp: Date.now() });
+    userId = 'user-b';
 
     await replay.flush();
 
     expect(fetch).not.toHaveBeenCalled();
+    // A user change after buffering discards the pending event.
+    userId = 'user-a';
+    manager.getSessionId();
+    replay.addEvent({ type: 3, timestamp: Date.now() });
+    await replay.flush();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, request] = vi.mocked(fetch).mock.calls[0];
+    expect(url).toContain(`/api/replays/${manager.getSessionId()}/chunks`);
+    expect((request.headers as Record<string, string>)['X-Segment-Id']).toBe('0');
+    expect((request.headers as Record<string, string>)['X-Replay-User-Id']).toBe('user-a');
+    expect(identity.sessionId).not.toBe(manager.getSessionId());
     replay.destroy();
     manager.destroy();
   });

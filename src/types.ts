@@ -100,6 +100,18 @@ export interface SessionState {
   segmentId: number;
 }
 
+/** Identity captured before a pending event enters asynchronous transport. */
+export interface ReplayIdentity {
+  sessionId: string;
+  mode: ReplayMode;
+  userId: string;
+}
+
+/** Atomically allocated identity for one writable chunk. */
+export interface ReplaySegmentAllocation extends ReplayIdentity {
+  segmentId: number;
+}
+
 // ============================================================================
 // Chunk / Transport Types
 // ============================================================================

@@ -205,6 +205,8 @@ export function replayIntegration(
             } catch { return ''; }
           },
           () => session!.getState().lastActivity + resolvedConfig!.idleTimeout,
+          () => session!.allocateSegment(),
+          () => session!.getIdentity(),
         );
 
         // Start recording immediately (LOCKED: recording starts on init())

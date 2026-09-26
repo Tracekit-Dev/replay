@@ -13,7 +13,7 @@
  *   [session+error, 1.0]                      -> mode = 'off'     (no recording)
  */
 
-import type { ResolvedReplayConfig, SessionState, ReplayMode } from './types';
+import type { ResolvedReplayConfig, SessionState, ReplayIdentity, ReplayMode, ReplaySegmentAllocation } from './types';
 import { RingBuffer } from './buffer';
 
 // ---------------------------------------------------------------------------
@@ -24,7 +24,11 @@ const SESSION_STORAGE_PREFIX = '__tracekit_replay_session_v2';
 const SESSION_ID_PATTERN = /^[0-9a-f]{32}$/;
 const MAX_SEGMENT_ID = Number.MAX_SAFE_INTEGER;
 
-type StoredSession = SessionState & { ownerToken: string };
+type StoredSession = SessionState & {
+  ownerToken: string;
+  documentToken: string;
+  active: boolean;
+};
 const DOCUMENT_TOKEN = randomHex(32);
 
 function randomHex(length: number): string {
@@ -148,6 +152,7 @@ export class SessionManager {
   private idleStopCallback: (() => void) | null = null;
   private userIdentityProvider: (() => string) | null = null;
   private identityUserId: string;
+  private rotatingUserId: string | null = null;
   private readonly ownerToken = randomHex(32);
   private rotating = false;
   private activityHandlers: Array<[string, (event: Event) => void]> = [];
@@ -224,6 +229,7 @@ export class SessionManager {
    * sessions in buffer mode.
    */
   onError(): void {
+    this.ensureIdentitySafety();
     if (this.active && Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
       this.handleIdleTimeout();
       return;
@@ -248,7 +254,7 @@ export class SessionManager {
       }
       // Switch to full recording mode
       this.state.mode = 'session';
-      persistSession(this.state);
+      persistSession(this.state, this.config, this.ownerToken);
     }
     // session mode or off mode: no-op
   }
@@ -309,6 +315,16 @@ export class SessionManager {
   /** Return the retained identity needed while flushing an inactive session. */
   getFlushSessionId(): string { return this.state.sessionId; }
 
+  /** Return the identity that owns events currently entering transport. */
+  getIdentity(): ReplayIdentity {
+    this.ensureIdentitySafety();
+    return {
+      sessionId: this.state.sessionId,
+      mode: this.state.mode,
+      userId: this.rotatingUserId ?? this.identityUserId,
+    };
+  }
+
   isActive(): boolean { return this.active; }
   isVisible(): boolean { return typeof document === 'undefined' || document.visibilityState === 'visible'; }
 
@@ -324,6 +340,21 @@ export class SessionManager {
     const next = this.state.segmentId++;
     persistSession(this.state, this.config, this.ownerToken);
     return next;
+  }
+
+  /** Allocate the session and segment identity as one synchronous ownership claim. */
+  allocateSegment(): ReplaySegmentAllocation {
+    this.ensureIdentitySafety();
+    if (this.state.segmentId >= MAX_SEGMENT_ID) this.rotateIdentity();
+    const allocation: ReplaySegmentAllocation = {
+      sessionId: this.state.sessionId,
+      segmentId: this.state.segmentId,
+      mode: this.state.mode,
+      userId: this.rotatingUserId ?? this.identityUserId,
+    };
+    this.state.segmentId += 1;
+    persistSession(this.state, this.config, this.ownerToken);
+    return allocation;
   }
 
   /** Get full session state */
@@ -396,7 +427,7 @@ export class SessionManager {
     }
     if (this.active && now - this.state.lastActivity < this.config.idleTimeout) {
       this.state.lastActivity = now;
-      persistSession(this.state);
+      persistSession(this.state, this.config, this.ownerToken);
       this.resetIdleTimer();
       return false;
     }
@@ -420,6 +451,7 @@ export class SessionManager {
     if (this.rotating) return;
     const userIdentity = this.readUserIdentity();
     if (userIdentity !== this.identityUserId) {
+      this.rotatingUserId = this.identityUserId;
       this.identityUserId = userIdentity;
       this.rotateIdentity();
       return;
@@ -468,6 +500,7 @@ export class SessionManager {
         try { this.restartCallback(); } catch { /* Never crash the host app */ }
       }
     } finally {
+      this.rotatingUserId = null;
       this.rotating = false;
     }
   }

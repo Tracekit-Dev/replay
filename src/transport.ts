@@ -14,7 +14,7 @@
  * The transport NEVER throws -- replay must never crash the host app.
  */
 
-import type { ResolvedReplayConfig } from './types';
+import type { ReplayIdentity, ReplaySegmentAllocation, ResolvedReplayConfig } from './types';
 import { gzipSync } from 'fflate';
 import { CompressionWorker } from './compression';
 
@@ -33,6 +33,9 @@ export class ReplayTransport {
   private bufferSize = 0;
   private recordingWindowStart: number | null = null;
   private recordingDeadlineFn: (() => number) | null = null;
+  private allocateSegmentFn: (() => ReplaySegmentAllocation) | null = null;
+  private identityFn: (() => ReplayIdentity) | null = null;
+  private pendingIdentity: ReplayIdentity | null = null;
 
   // Interaction counters (accumulated across all chunks)
   private clickCount = 0;
@@ -66,6 +69,8 @@ export class ReplayTransport {
     getUrl: () => string,
     getUserId: () => string,
     getRecordingDeadline?: () => number,
+    allocateSegment?: () => ReplaySegmentAllocation,
+    getIdentity?: () => ReplayIdentity,
   ): void {
     this.sessionIdFn = getSessionId;
     this.segmentIdFn = nextSegmentId;
@@ -73,6 +78,8 @@ export class ReplayTransport {
     this.urlFn = getUrl;
     this.userIdFn = getUserId;
     this.recordingDeadlineFn = getRecordingDeadline ?? null;
+    this.allocateSegmentFn = allocateSegment ?? null;
+    this.identityFn = getIdentity ?? null;
 
     // Start periodic flush at config.flushInterval (default 30s)
     this.flushTimer = setInterval(() => {
@@ -100,6 +107,7 @@ export class ReplayTransport {
     this.pendingEvents = [];
     this.bufferSize = 0;
     this.recordingWindowStart = null;
+    this.pendingIdentity = null;
   }
 
   /** Start a visible recorder interval. Hidden time never belongs to a chunk. */
@@ -140,6 +148,9 @@ export class ReplayTransport {
    */
   addEvent(event: any): void {
     try {
+      if (this.pendingEvents.length === 0 && this.identityFn) {
+        this.pendingIdentity = this.identityFn();
+      }
       // An error buffer begins at its oldest retained event, not recorder start.
       if (this.pendingEvents.length === 0 && this.replayTypeFn?.() === 'buffer' &&
           Number.isFinite(event.timestamp)) {
@@ -208,16 +219,26 @@ export class ReplayTransport {
     const events = this.pendingEvents;
     this.pendingEvents = [];
     this.bufferSize = 0;
+    const pendingIdentity = this.pendingIdentity;
+    this.pendingIdentity = null;
 
     try {
-      const sessionId = this.sessionIdFn ? this.sessionIdFn() : '';
-      const segmentId = this.segmentIdFn ? this.segmentIdFn() : 0;
+      const allocation = this.allocateSegmentFn?.() ?? {
+        sessionId: this.sessionIdFn ? this.sessionIdFn() : '',
+        segmentId: this.segmentIdFn ? this.segmentIdFn() : 0,
+        mode: this.replayTypeFn?.() ?? 'session',
+        userId: this.userIdFn?.() ?? '',
+      };
+      const { sessionId, segmentId } = allocation;
 
       if (!sessionId) {
         return; // No session -- discard events
       }
+      if (pendingIdentity && (pendingIdentity.sessionId !== allocation.sessionId || pendingIdentity.userId !== allocation.userId)) {
+        return; // Do not attribute events across an identity boundary.
+      }
 
-      const headers = this.uploadHeaders(segmentId);
+      const headers = this.uploadHeaders(segmentId, allocation.userId, allocation.mode);
 
       // Compress via worker (or main-thread fallback)
       const { compressed, originalSize } = await this.compressionWorker.compress(events, segmentId);
@@ -249,12 +270,21 @@ export class ReplayTransport {
       const events = this.pendingEvents;
       this.pendingEvents = [];
       this.bufferSize = 0;
+      const pendingIdentity = this.pendingIdentity;
+      this.pendingIdentity = null;
 
-      const sessionId = this.sessionIdFn ? this.sessionIdFn() : '';
-      const segmentId = this.segmentIdFn ? this.segmentIdFn() : 0;
-      const replayType = this.replayTypeFn ? this.replayTypeFn() : 'session';
+      const allocation = this.allocateSegmentFn?.() ?? {
+        sessionId: this.sessionIdFn ? this.sessionIdFn() : '',
+        segmentId: this.segmentIdFn ? this.segmentIdFn() : 0,
+        mode: this.replayTypeFn?.() ?? 'session',
+        userId: this.userIdFn?.() ?? '',
+      };
+      const { sessionId, segmentId, mode: replayType } = allocation;
 
       if (!sessionId) {
+        return;
+      }
+      if (pendingIdentity && (pendingIdentity.sessionId !== allocation.sessionId || pendingIdentity.userId !== allocation.userId)) {
         return;
       }
 
@@ -265,7 +295,7 @@ export class ReplayTransport {
 
       // Build URL with query parameters (sendBeacon cannot set custom headers)
       const replayUrl = this.urlFn ? this.urlFn() : '';
-      const replayUserId = this.userIdFn ? this.userIdFn() : '';
+      const replayUserId = allocation.userId;
       const url =
         `${this.config.endpoint}/api/replays/${sessionId}/chunks` +
         `?api_key=${encodeURIComponent(this.config.apiKey)}` +
@@ -356,14 +386,14 @@ export class ReplayTransport {
   }
 
   /** Capture metadata before compression or retries can cross a session boundary. */
-  private uploadHeaders(segmentId: number): Record<string, string> {
+  private uploadHeaders(segmentId: number, userId: string, replayType: string): Record<string, string> {
     return {
       'Content-Type': 'application/octet-stream',
       'X-API-Key': this.config.apiKey,
       'X-Segment-Id': String(segmentId),
-      'X-Replay-Type': this.replayTypeFn?.() ?? 'session',
+      'X-Replay-Type': replayType,
       'X-Replay-Url': this.urlFn?.() ?? '',
-      'X-Replay-User-Id': this.userIdFn?.() ?? '',
+      'X-Replay-User-Id': userId,
       'X-Replay-User-Agent': typeof navigator !== 'undefined' ? navigator.userAgent : '',
       'X-Click-Count': String(this.clickCount),
       'X-Keypress-Count': String(this.keypressCount),
