@@ -426,7 +426,14 @@ function sanitizeReplayEventDraft(event: unknown, config: ResolvedReplayConfig |
           return effective(id, states).block ? [] : [{ id, attributes: attributes(item.attributes, tokens, prior?.tagName) }];
         });
         const removes = raw.data.removes.map((item: any) => ({ parentId: finite(item.parentId), id: finite(item.id) }));
-        for (const item of removes) if (item.id !== null) forget(item.id, states);
+        for (const item of removes) {
+          if (item.parentId === null || item.id === null ||
+              !Number.isSafeInteger(item.parentId) || !Number.isSafeInteger(item.id) ||
+              !states.has(item.parentId) || states.get(item.id)?.parentId !== item.parentId) {
+            throw new Error('inconsistent mutation remove');
+          }
+        }
+        for (const item of removes) forget(item.id!, states);
         data = { source, adds, texts, attributes: changedAttributes, removes };
     } else if (source === 5) {
       const id = finite(raw.data.id);
