@@ -17,6 +17,7 @@
 import type { ReplayIdentity, ReplaySegmentAllocation, ResolvedReplayConfig } from './types';
 import { gzipSync } from 'fflate';
 import { CompressionWorker } from './compression';
+import { sanitizeMetadataValue, sanitizeReplayEvents, sanitizeReplayUrl } from './privacy';
 
 // Retry delays in milliseconds: 1s, 2s, 4s
 const RETRY_DELAYS = [1000, 2000, 4000];
@@ -39,6 +40,7 @@ export class ReplayTransport {
   private generation = 0;
   private activeRequests = new Set<AbortController>();
   private retryWaiters = new Map<ReturnType<typeof setTimeout>, (active: boolean) => void>();
+  private cancelled = false;
 
   // Interaction counters (accumulated across all chunks)
   private clickCount = 0;
@@ -76,6 +78,7 @@ export class ReplayTransport {
     getIdentity?: () => ReplayIdentity,
   ): void {
     this.stop();
+    this.cancel();
     this.sessionIdFn = getSessionId;
     this.segmentIdFn = nextSegmentId;
     this.replayTypeFn = getReplayType;
@@ -84,6 +87,7 @@ export class ReplayTransport {
     this.recordingDeadlineFn = getRecordingDeadline ?? null;
     this.allocateSegmentFn = allocateSegment ?? null;
     this.identityFn = getIdentity ?? null;
+    this.cancelled = false;
 
     // Start periodic flush at config.flushInterval (default 30s)
     this.flushTimer = setInterval(() => {
@@ -114,6 +118,7 @@ export class ReplayTransport {
   /** Invalidate asynchronous work and discard all local pending data. */
   cancel(): void {
     this.generation += 1;
+    this.cancelled = true;
     this.pendingEvents = [];
     this.bufferSize = 0;
     this.recordingWindowStart = null;
@@ -165,6 +170,10 @@ export class ReplayTransport {
    */
   addEvent(event: any): void {
     try {
+      if (this.cancelled) return;
+      const safeEvent = sanitizeReplayEvents([event], { unmask: this.config.unmask })[0];
+      if (!safeEvent) return;
+      event = safeEvent;
       if (this.pendingEvents.length === 0 && this.identityFn) {
         this.pendingIdentity = this.identityFn();
       }
@@ -228,6 +237,7 @@ export class ReplayTransport {
    */
   async flush(): Promise<void> {
     const generation = this.generation;
+    if (this.cancelled) return;
     this.appendRecordingBoundaries();
     if (this.pendingEvents.length === 0) {
       return;
@@ -257,10 +267,13 @@ export class ReplayTransport {
         return; // Do not attribute events across an identity boundary.
       }
 
+      const safeEvents = sanitizeReplayEvents(events, { unmask: this.config.unmask });
+      if (safeEvents.length === 0) return;
+
       const headers = this.uploadHeaders(segmentId, allocation.userId, allocation.mode);
 
       // Compress via worker (or main-thread fallback)
-      const { compressed, originalSize } = await this.compressionWorker.compress(events, segmentId);
+      const { compressed, originalSize } = await this.compressionWorker.compress(safeEvents, segmentId);
       if (!this.isCurrent(generation)) return;
 
       // Upload with retry
@@ -282,6 +295,8 @@ export class ReplayTransport {
    * If both fail, data is lost (acceptable for replay).
    */
   flushSync(): void {
+    const generation = this.generation;
+    if (this.cancelled) return;
     this.appendRecordingBoundaries();
     if (this.pendingEvents.length === 0) {
       return;
@@ -309,14 +324,17 @@ export class ReplayTransport {
         return;
       }
 
+      const safeEvents = sanitizeReplayEvents(events, { unmask: this.config.unmask });
+      if (safeEvents.length === 0 || !this.isCurrent(generation)) return;
+
       // Compress on main thread (sync -- sendBeacon requires sync data)
-      const json = JSON.stringify(events);
+      const json = JSON.stringify(safeEvents);
       const encoded = new TextEncoder().encode(json);
       const compressed = gzipSync(encoded, { level: 6 });
 
       // Build URL with query parameters (sendBeacon cannot set custom headers)
-      const replayUrl = this.urlFn ? this.urlFn() : '';
-      const replayUserId = allocation.userId;
+      const replayUrl = sanitizeReplayUrl(this.urlFn ? this.urlFn() : '');
+      const replayUserId = sanitizeMetadataValue(allocation.userId);
       const serviceName = this.boundedServiceName();
       const url =
         `${this.config.endpoint}/api/replays/${sessionId}/chunks` +
@@ -333,6 +351,8 @@ export class ReplayTransport {
       // Cast through ArrayBuffer to satisfy TypeScript 5.x Uint8Array<ArrayBufferLike> vs BlobPart
       const blob = new Blob([compressed as unknown as BlobPart], { type: 'application/octet-stream' });
 
+      if (!this.isCurrent(generation)) return;
+
       // Try sendBeacon first (works during page unload)
       if (compressed.byteLength <= BEACON_SIZE_LIMIT && typeof navigator !== 'undefined' && navigator.sendBeacon) {
         const sent = navigator.sendBeacon(url, blob);
@@ -343,6 +363,7 @@ export class ReplayTransport {
 
       // Fallback: fetch with keepalive (also has ~64KB limit but is the standard approach)
       if (typeof fetch !== 'undefined') {
+        if (!this.isCurrent(generation)) return;
         fetch(url, {
           method: 'POST',
           headers: {
@@ -425,9 +446,9 @@ export class ReplayTransport {
       'X-API-Key': this.config.apiKey,
       'X-Segment-Id': String(segmentId),
       'X-Replay-Type': replayType,
-      'X-Replay-Url': this.urlFn?.() ?? '',
-      'X-Replay-User-Id': userId,
-      'X-Replay-User-Agent': typeof navigator !== 'undefined' ? navigator.userAgent : '',
+      'X-Replay-Url': sanitizeReplayUrl(this.urlFn?.() ?? ''),
+      'X-Replay-User-Id': sanitizeMetadataValue(userId),
+      'X-Replay-User-Agent': sanitizeMetadataValue(typeof navigator !== 'undefined' ? navigator.userAgent : ''),
       'X-Click-Count': String(this.clickCount),
       'X-Keypress-Count': String(this.keypressCount),
       ...(serviceName ? { 'X-Replay-Service-Name': serviceName } : {}),
@@ -436,7 +457,7 @@ export class ReplayTransport {
 
   /** Return only a bounded, non-control service discriminator for the server. */
   private boundedServiceName(): string {
-    const serviceName = this.config.serviceName.trim();
+    const serviceName = sanitizeMetadataValue(this.config.serviceName).trim();
     if (serviceName.length === 0 || serviceName.length > 255 || /[\u0000-\u001f\u007f]/.test(serviceName)) {
       return '';
     }
@@ -461,6 +482,6 @@ export class ReplayTransport {
   }
 
   private isCurrent(generation: number): boolean {
-    return this.generation === generation;
+    return !this.cancelled && this.generation === generation;
   }
 }

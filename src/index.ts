@@ -25,6 +25,7 @@ import { startRecording } from './recorder';
 import { SessionManager } from './session';
 import { CompressionWorker } from './compression';
 import { ReplayTransport } from './transport';
+import { sanitizeCustomEventPayload } from './privacy';
 
 /**
  * Create a session replay integration for @tracekit/browser.
@@ -161,7 +162,7 @@ export function replayIntegration(
         const breadcrumbBridge = (crumb: any) => {
           try {
             if (crumb.type === 'http' || crumb.category?.startsWith('fetch') || crumb.category?.startsWith('xhr')) {
-              record.addCustomEvent('network-request', {
+              const payload = sanitizeCustomEventPayload({
                 method: crumb.data?.method || 'GET',
                 url: crumb.data?.url || crumb.message || '',
                 status: crumb.data?.status_code,
@@ -169,6 +170,7 @@ export function replayIntegration(
                 error: crumb.data?.error,
                 traceparent: crumb.data?.traceparent,
               });
+              if (payload) record.addCustomEvent('network-request', payload);
             } else if (crumb.type === 'console' || crumb.category?.startsWith('console.')) {
               // Console tab requires expandable objects and stack traces for errors
               const payload: Record<string, unknown> = {
@@ -183,7 +185,8 @@ export function replayIntegration(
               if ((crumb.category === 'console.error' || crumb.category === 'console.warn') && crumb.data?.stack) {
                 payload.stack = crumb.data.stack;
               }
-              record.addCustomEvent('console-log', payload);
+              const safePayload = sanitizeCustomEventPayload(payload);
+              if (safePayload) record.addCustomEvent('console-log', safePayload);
             }
           } catch {
             // Never crash the host app
