@@ -47,6 +47,7 @@ export class ReplayTransport {
   private activeRequests = new Set<AbortController>();
   private retryWaiters = new Map<ReturnType<typeof setTimeout>, (active: boolean) => void>();
   private cancelled = false;
+  private hasStarted = false;
   private awaitingSnapshot = false;
   private retainedBufferHistory = false;
   private pendingRegionHadSnapshot = false;
@@ -158,6 +159,7 @@ export class ReplayTransport {
     this.status.state = 'recording';
     this.status.captureState = 'recording';
     this.status.deliveryState = 'idle';
+    this.hasStarted = true;
     this.publish('started');
 
     // Start periodic flush at config.flushInterval (default 30s)
@@ -193,6 +195,8 @@ export class ReplayTransport {
     this.pendingEvents = [];
     this.bufferSize = 0;
     this.pendingRegionHadSnapshot = false;
+    this.awaitingSnapshot = this.hasStarted;
+    this.retainedBufferHistory = false;
     this.recordingWindowStart = null;
     this.pendingIdentity = null;
     for (const controller of this.activeRequests) controller.abort();
@@ -254,7 +258,18 @@ export class ReplayTransport {
     try {
       if (this.cancelled) return;
       const safeEvent = sanitizeReplayEvents([event], { unmask: this.config.unmask, blockMedia: this.config.blockMedia })[0];
-      if (!safeEvent) return;
+      if (!safeEvent) {
+        if (event?.type === 2) {
+          this.pendingEvents = [];
+          this.bufferSize = 0;
+          this.pendingRegionHadSnapshot = false;
+          this.awaitingSnapshot = true;
+          this.retainedBufferHistory = false;
+          this.status.droppedEvents++;
+          this.publish('snapshot_rejected');
+        }
+        return;
+      }
       event = safeEvent;
       if (this.pendingEvents.length === 0 && this.identityFn) {
         this.pendingIdentity = this.identityFn();
