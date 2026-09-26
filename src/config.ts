@@ -62,6 +62,8 @@ export function resolveReplayConfig(
   config: ReplayConfig,
   apiKey: string,
   endpoint: string,
+  serviceName = '',
+  identityUserId = '',
 ): ResolvedReplayConfig {
   let sessionSampleRate = clampRate(
     config.sessionSampleRate ?? DEFAULTS.sessionSampleRate,
@@ -94,6 +96,8 @@ export function resolveReplayConfig(
     maxBufferSize: config.maxBufferSize ?? DEFAULTS.maxBufferSize,
     inlineImages: config.inlineImages ?? DEFAULTS.inlineImages,
     blockMedia: config.blockMedia ?? DEFAULTS.blockMedia,
+    serviceName: config.serviceName ?? serviceName,
+    identityUserId,
     apiKey,
     endpoint,
   };

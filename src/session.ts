@@ -13,26 +13,58 @@
  *   [session+error, 1.0]                      -> mode = 'off'     (no recording)
  */
 
-import type { ResolvedReplayConfig, SessionState, ReplayMode } from './types';
+import type { ResolvedReplayConfig, SessionState, ReplayIdentity, ReplayMode, ReplaySegmentAllocation } from './types';
 import { RingBuffer } from './buffer';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const SESSION_STORAGE_KEY = '__tracekit_replay_session';
+const SESSION_STORAGE_PREFIX = '__tracekit_replay_session_v2';
+const SESSION_ID_PATTERN = /^[0-9a-f]{32}$/;
+const MAX_SEGMENT_ID = Number.MAX_SAFE_INTEGER;
+
+type StoredSession = SessionState & {
+  ownerToken: string;
+  documentToken: string;
+  active: boolean;
+};
+const DOCUMENT_TOKEN = randomHex(32);
+
+function randomHex(length: number): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID().replace(/-/g, '').slice(0, length).padEnd(length, '0');
+  }
+  return Array.from({ length }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+}
+
+function namespaceDigest(value: string): string {
+  // A stable digest keeps raw API keys, endpoints, and service names out of storage.
+  // It namespaces client state; it does not grant server authorization.
+  let hash = 0xcbf29ce484222325n;
+  for (const byte of new TextEncoder().encode(value)) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return hash.toString(16).padStart(16, '0');
+}
+
+function normalizedEndpoint(endpoint: string): string {
+  try { return new URL(endpoint).origin; } catch { return endpoint.trim(); }
+}
+
+/** Return the versioned, credential-free storage key for a replay client. */
+export function storageKeyForConfig(config: ResolvedReplayConfig): string {
+  const scope = [normalizedEndpoint(config.endpoint), (config.serviceName ?? '').trim(), config.apiKey].join('\u0000');
+  return `${SESSION_STORAGE_PREFIX}:${namespaceDigest(scope)}`;
+}
 
 /**
  * Generate a 32-character hex session ID.
  * Prefers crypto.randomUUID() where available, falls back to Math.random().
  */
-function newSessionId(): string {
-  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-    return crypto.randomUUID().replace(/-/g, '');
-  }
-  return Array.from({ length: 32 }, () =>
-    Math.floor(Math.random() * 16).toString(16),
-  ).join('');
+function newSessionId(config: ResolvedReplayConfig): string {
+  return `${namespaceDigest(`${normalizedEndpoint(config.endpoint)}\u0000${config.serviceName ?? ''}`).slice(0, 8)}${randomHex(24)}`;
 }
 
 /**
@@ -40,17 +72,17 @@ function newSessionId(): string {
  * full page reloads in server-rendered (non-SPA) apps.
  * Returns { sessionId, segmentId, isExisting }
  */
-function getOrCreateSession(config: ResolvedReplayConfig): { sessionId: string; segmentId: number; mode: ReplayMode; isExisting: boolean } {
+function getOrCreateSession(config: ResolvedReplayConfig, ownerToken: string): { sessionId: string; segmentId: number; mode: ReplayMode; isExisting: boolean } {
   try {
     if (typeof sessionStorage !== 'undefined') {
-      const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
+      const raw = sessionStorage.getItem(storageKeyForConfig(config));
       if (raw) {
         const stored = JSON.parse(raw);
         const segmentId = stored.segmentId;
         const mode = stored.mode;
         const age = Date.now() - Number(stored.lastActivity);
-        if (stored.sessionId && typeof stored.sessionId === 'string' &&
-            Number.isInteger(segmentId) && segmentId >= 0 &&
+        if ((stored.ownerToken === ownerToken || (stored.documentToken === DOCUMENT_TOKEN && stored.active === false)) && SESSION_ID_PATTERN.test(stored.sessionId) &&
+            Number.isSafeInteger(segmentId) && segmentId >= 0 && segmentId <= MAX_SEGMENT_ID &&
             (mode === 'session' || mode === 'buffer' || mode === 'off') &&
             Number.isFinite(age) && age >= 0 && age < config.idleTimeout) {
           return { sessionId: stored.sessionId, segmentId, mode, isExisting: true };
@@ -60,21 +92,28 @@ function getOrCreateSession(config: ResolvedReplayConfig): { sessionId: string; 
   } catch {
     // sessionStorage may be unavailable (private browsing, etc.)
   }
-  return { sessionId: newSessionId(), segmentId: 0, mode: decideSamplingMode(config), isExisting: false };
+  return { sessionId: newSessionId(config), segmentId: 0, mode: decideSamplingMode(config), isExisting: false };
 }
 
 /**
  * Persist session state to sessionStorage.
  */
-function persistSession(state: SessionState): void {
+function persistSession(state: SessionState, config: ResolvedReplayConfig, ownerToken: string, active = true): void {
   try {
     if (typeof sessionStorage !== 'undefined') {
-      sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({
+      const serialized = JSON.stringify({
         sessionId: state.sessionId,
         segmentId: state.segmentId,
         mode: state.mode,
         lastActivity: state.lastActivity,
-      }));
+        ownerToken,
+        documentToken: DOCUMENT_TOKEN,
+        active,
+      });
+      sessionStorage.setItem(storageKeyForConfig(config), serialized);
+      // Older direct consumers may still inspect this key. Replay never reads it.
+      // Resolved production configs always include serviceName, so this path is compatibility-only.
+      if (config.serviceName === undefined) sessionStorage.setItem('__tracekit_replay_session', serialized);
     }
   } catch {
     // Ignore storage errors
@@ -111,6 +150,11 @@ export class SessionManager {
   private pauseCallback: (() => void) | null = null;
   private resumeCallback: (() => void) | null = null;
   private idleStopCallback: (() => void) | null = null;
+  private userIdentityProvider: (() => string) | null = null;
+  private identityUserId: string;
+  private rotatingUserId: string | null = null;
+  private readonly ownerToken = randomHex(32);
+  private rotating = false;
   private activityHandlers: Array<[string, (event: Event) => void]> = [];
   private active = true;
 
@@ -124,7 +168,8 @@ export class SessionManager {
     this.config = config;
     this.ringBuffer = new RingBuffer(60_000);
 
-    const existing = getOrCreateSession(config);
+    this.identityUserId = config.identityUserId ?? '';
+    const existing = getOrCreateSession(config, this.ownerToken);
     const mode = existing.mode;
     const now = Date.now();
 
@@ -137,7 +182,7 @@ export class SessionManager {
     };
 
     this.active = this.isVisible();
-    persistSession(this.state);
+    persistSession(this.state, this.config, this.ownerToken);
     if (this.active) this.resetIdleTimer();
     this.setupVisibilityListener();
     this.setupActivityListeners();
@@ -154,6 +199,7 @@ export class SessionManager {
    * - off mode: discard
    */
   onEvent(event: any, _isCheckout: boolean): void {
+    this.ensureIdentitySafety();
     if (!this.active || !this.isVisible()) return;
     if (Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
       this.handleIdleTimeout();
@@ -183,6 +229,7 @@ export class SessionManager {
    * sessions in buffer mode.
    */
   onError(): void {
+    this.ensureIdentitySafety();
     if (this.active && Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
       this.handleIdleTimeout();
       return;
@@ -207,7 +254,7 @@ export class SessionManager {
       }
       // Switch to full recording mode
       this.state.mode = 'session';
-      persistSession(this.state);
+      persistSession(this.state, this.config, this.ownerToken);
     }
     // session mode or off mode: no-op
   }
@@ -246,12 +293,19 @@ export class SessionManager {
     this.idleStopCallback = cb;
   }
 
+  /** Set a transient user boundary provider. User IDs never enter storage. */
+  setUserIdentityProvider(provider: () => string): void {
+    this.userIdentityProvider = provider;
+    this.identityUserId = this.readUserIdentity();
+  }
+
   // -------------------------------------------------------------------------
   // Accessors
   // -------------------------------------------------------------------------
 
   /** Current session ID */
   getSessionId(): string {
+    this.ensureIdentitySafety();
     if (this.active && Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
       this.handleIdleTimeout();
     }
@@ -260,6 +314,16 @@ export class SessionManager {
 
   /** Return the retained identity needed while flushing an inactive session. */
   getFlushSessionId(): string { return this.state.sessionId; }
+
+  /** Return the identity that owns events currently entering transport. */
+  getIdentity(): ReplayIdentity {
+    this.ensureIdentitySafety();
+    return {
+      sessionId: this.state.sessionId,
+      mode: this.state.mode,
+      userId: this.rotatingUserId ?? this.identityUserId,
+    };
+  }
 
   isActive(): boolean { return this.active; }
   isVisible(): boolean { return typeof document === 'undefined' || document.visibilityState === 'visible'; }
@@ -271,9 +335,26 @@ export class SessionManager {
 
   /** Return and increment segment counter */
   nextSegmentId(): number {
+    this.ensureIdentitySafety();
+    if (this.state.segmentId >= MAX_SEGMENT_ID) this.rotateIdentity();
     const next = this.state.segmentId++;
-    persistSession(this.state);
+    persistSession(this.state, this.config, this.ownerToken);
     return next;
+  }
+
+  /** Allocate the session and segment identity as one synchronous ownership claim. */
+  allocateSegment(): ReplaySegmentAllocation {
+    this.ensureIdentitySafety();
+    if (this.state.segmentId >= MAX_SEGMENT_ID) this.rotateIdentity();
+    const allocation: ReplaySegmentAllocation = {
+      sessionId: this.state.sessionId,
+      segmentId: this.state.segmentId,
+      mode: this.state.mode,
+      userId: this.rotatingUserId ?? this.identityUserId,
+    };
+    this.state.segmentId += 1;
+    persistSession(this.state, this.config, this.ownerToken);
+    return allocation;
   }
 
   /** Get full session state */
@@ -334,9 +415,11 @@ export class SessionManager {
 
     this.active = false;
     this.ringBuffer.clear();
+    persistSession(this.state, this.config, this.ownerToken, false);
   }
 
   private renewFromVisibleActivity(): boolean {
+    this.ensureIdentitySafety();
     if (!this.isVisible()) return false;
     const now = Date.now();
     if (this.active && now - this.state.lastActivity >= this.config.idleTimeout) {
@@ -344,20 +427,87 @@ export class SessionManager {
     }
     if (this.active && now - this.state.lastActivity < this.config.idleTimeout) {
       this.state.lastActivity = now;
-      persistSession(this.state);
+      persistSession(this.state, this.config, this.ownerToken);
       this.resetIdleTimer();
       return false;
     }
 
-    this.state = { sessionId: newSessionId(), mode: decideSamplingMode(this.config), startedAt: now, lastActivity: now, segmentId: 0 };
+    this.state = { sessionId: newSessionId(this.config), mode: decideSamplingMode(this.config), startedAt: now, lastActivity: now, segmentId: 0 };
     this.active = true;
     this.ringBuffer.clear();
-    persistSession(this.state);
+    persistSession(this.state, this.config, this.ownerToken);
     this.resetIdleTimer();
     if (this.state.mode !== 'off' && this.restartCallback) {
       try { this.restartCallback(); } catch { /* Never crash the host app */ }
     }
     return true;
+  }
+
+  private readUserIdentity(): string {
+    try { return String(this.userIdentityProvider?.() ?? ''); } catch { return ''; }
+  }
+
+  private ensureIdentitySafety(): void {
+    if (this.rotating) return;
+    const userIdentity = this.readUserIdentity();
+    if (userIdentity !== this.identityUserId) {
+      this.rotatingUserId = this.identityUserId;
+      this.identityUserId = userIdentity;
+      this.rotateIdentity();
+      return;
+    }
+
+    try {
+      if (typeof sessionStorage === 'undefined') return;
+      const raw = sessionStorage.getItem(storageKeyForConfig(this.config));
+      if (!raw) {
+        this.rotateIdentity();
+        return;
+      }
+      const stored = JSON.parse(raw) as Partial<StoredSession>;
+      if (stored.ownerToken !== this.ownerToken || stored.documentToken !== DOCUMENT_TOKEN || stored.active !== true || !SESSION_ID_PATTERN.test(String(stored.sessionId ?? '')) ||
+          !Number.isSafeInteger(stored.segmentId) || Number(stored.segmentId) < 0 || Number(stored.segmentId) > MAX_SEGMENT_ID) {
+        this.rotateIdentity();
+      }
+    } catch {
+      // Blocked storage cannot prove a competing owner. The random in-memory identity remains isolated.
+    }
+  }
+
+  private rotateIdentity(): void {
+    if (this.rotating) return;
+    this.rotating = true;
+    try {
+      if (this.idleStopCallback) {
+        try { this.idleStopCallback(); } catch { /* Never crash the host app */ }
+      }
+      if (this.flushCallback) {
+        try { this.flushCallback(); } catch { /* Never crash the host app */ }
+      }
+      const now = Date.now();
+      this.state = {
+        sessionId: newSessionId(this.config),
+        mode: decideSamplingMode(this.config),
+        startedAt: now,
+        lastActivity: now,
+        segmentId: 0,
+      };
+      this.active = this.isVisible();
+      this.ringBuffer.clear();
+      persistSession(this.state, this.config, this.ownerToken);
+      if (this.active) this.resetIdleTimer();
+
+      // The old user marker applies only to the synchronous flush above.
+      // Clear it before the restarted recorder can emit new events.
+      this.rotatingUserId = null;
+
+      if (this.active && this.state.mode !== 'off' && this.restartCallback) {
+        try { this.restartCallback(); } catch { /* Never crash the host app */ }
+      }
+    } finally {
+      this.rotatingUserId = null;
+      this.rotating = false;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -437,6 +587,7 @@ export class SessionManager {
     this.activityHandlers = [];
 
     this.ringBuffer.clear();
+    persistSession(this.state, this.config, this.ownerToken, false);
 
     this.eventCallback = null;
     this.flushCallback = null;
@@ -444,5 +595,6 @@ export class SessionManager {
     this.pauseCallback = null;
     this.resumeCallback = null;
     this.idleStopCallback = null;
+    this.userIdentityProvider = null;
   }
 }

@@ -53,12 +53,25 @@ export function replayIntegration(
      */
     install(client: any): void {
       try {
-        // Resolve config with client's apiKey and endpoint
+        // Resolve config with the client's credentials and service boundary.
+        // The service name is a discriminator, not a new authorization boundary.
         const clientConfig = client.getConfig();
-        resolvedConfig = resolveReplayConfig(config, clientConfig.apiKey, clientConfig.endpoint);
+        const scope = client.getScope();
+        let identityUserId = '';
+        try { identityUserId = String(scope?.getUser?.()?.id ?? ''); } catch { identityUserId = ''; }
+        resolvedConfig = resolveReplayConfig(
+          config,
+          clientConfig.apiKey,
+          clientConfig.endpoint,
+          typeof clientConfig.serviceName === 'string' ? clientConfig.serviceName : '',
+          identityUserId,
+        );
 
         // Create session manager (makes sampling decision)
         session = new SessionManager(resolvedConfig);
+        session.setUserIdentityProvider(() => {
+          try { return String(client.getScope()?.getUser?.()?.id ?? ''); } catch { return ''; }
+        });
 
         // Create compression worker (Web Worker with main-thread fallback)
         compressionWorker = new CompressionWorker();
@@ -115,7 +128,6 @@ export function replayIntegration(
         // Bridge breadcrumbs to rrweb custom events for playback sidebar tabs.
         // Network requests become 'network-request' events, console output becomes
         // 'console-log' events -- both timestamped in the rrweb event stream.
-        const scope = client.getScope();
         scope.onBreadcrumb((crumb: any) => {
           try {
             if (crumb.type === 'http' || crumb.category?.startsWith('fetch') || crumb.category?.startsWith('xhr')) {
@@ -193,6 +205,8 @@ export function replayIntegration(
             } catch { return ''; }
           },
           () => session!.getState().lastActivity + resolvedConfig!.idleTimeout,
+          () => session!.allocateSegment(),
+          () => session!.getIdentity(),
         );
 
         // Start recording immediately (LOCKED: recording starts on init())
