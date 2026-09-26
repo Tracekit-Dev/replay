@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RingBuffer } from '../src/buffer';
 import { resolveReplayConfig } from '../src/config';
 import { ReplayTransport } from '../src/transport';
+import { SessionManager } from '../src/session';
 import { gunzipSync, gzipSync } from 'fflate';
 
 const snapshot = (timestamp: number, text = '') => ({
@@ -21,6 +22,59 @@ const byteSize = (event: unknown) => new TextEncoder().encode(JSON.stringify(eve
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe('bounded error history', () => {
+  it.each(['events', 'bytes', 'age'])('reports %s baseline loss and clears dependent events', async (limit) => {
+    vi.useFakeTimers();
+    const first = snapshot(Date.now());
+    const later = mutation(Date.now() + 1);
+    const ring = new RingBuffer(limit === 'age' ? 10 : 60_000, {
+      maxBytes: limit === 'bytes' ? byteSize(first) + byteSize(later) + 1 : 4096,
+      maxEvents: limit === 'events' ? 2 : 10,
+    });
+    ring.add(first);
+    ring.add(later);
+    if (limit === 'age') await vi.advanceTimersByTimeAsync(11);
+    const result = ring.add(mutation(Date.now() + 2));
+    expect(result?.reason).toBe('baseline_lost');
+    expect(result?.droppedEvents).toBeGreaterThan(0);
+    expect(ring.size).toBe(0);
+  });
+
+  it.each([
+    ['future', 1_000_000_000], ['past', -1_000_000_000],
+    ['nonfinite', Number.NaN], ['normal', 1_000],
+  ])('uses local arrival age for %s rrweb timestamps', async (_label, timestamp) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const event = snapshot(timestamp);
+    const ring = new RingBuffer(10, { maxBytes: 4096, maxEvents: 10 });
+    ring.add(event);
+    await vi.advanceTimersByTimeAsync(9);
+    expect(ring.byteSize).toBeGreaterThan(0);
+    await vi.advanceTimersByTimeAsync(2);
+    const lost = ring.add(mutation(timestamp));
+    expect(lost?.reason).toBe('baseline_lost');
+    expect(event.timestamp).toBe(timestamp);
+    expect(ring.size).toBe(0);
+  });
+
+  it('requests one fresh error baseline until a full snapshot arrives', async () => {
+    const config = resolveReplayConfig({ sessionSampleRate: 0, errorSampleRate: 1, maxBufferSize: 320 }, 'key', 'https://api.test');
+    const manager = new SessionManager(config);
+    const restart = vi.fn();
+    const dropped = vi.fn();
+    manager.setRestartCallback(restart);
+    manager.setBufferDropCallback(dropped);
+    manager.onEvent(snapshot(Date.now()), false);
+    for (let i = 0; i < 20; i++) manager.onEvent(mutation(Date.now() + i), false);
+    await Promise.resolve();
+    expect(restart).toHaveBeenCalledOnce();
+    expect(dropped).toHaveBeenCalled();
+    manager.onEvent(snapshot(Date.now() + 100), false);
+    for (let i = 0; i < 20; i++) manager.onEvent(mutation(Date.now() + 101 + i), false);
+    await Promise.resolve();
+    expect(restart).toHaveBeenCalledTimes(2);
+    manager.destroy();
+  });
   it('counts serialized UTF-8 bytes and evicts complete snapshot regions', () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_800_000_000_000);
@@ -49,6 +103,122 @@ describe('bounded error history', () => {
 });
 
 describe('bounded delivery', () => {
+  it('sends version and zero-drop evidence on periodic fetch without a final marker', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal('fetch', fetchMock);
+    const config = resolveReplayConfig({ sessionSampleRate: 1 }, 'key', 'https://api.test');
+    const transport = new ReplayTransport(config, { compress: vi.fn(async (events: unknown[]) => {
+      const bytes = new TextEncoder().encode(JSON.stringify(events));
+      return { compressed: gzipSync(bytes), originalSize: bytes.length };
+    }) } as any);
+    transport.start(() => 'a'.repeat(32), () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent(snapshot(Date.now()));
+    await transport.flush();
+    const options = fetchMock.mock.calls[0][1] as any;
+    expect(options.headers['X-Replay-Protocol-Version']).toBe('1');
+    expect(options.headers['X-Replay-Dropped-Events']).toBe('0');
+    expect(options.headers).not.toHaveProperty('X-Replay-Final-Segment-Id');
+    expect(JSON.parse(new TextDecoder().decode(gunzipSync(options.body)))).toHaveLength(1);
+    transport.destroy();
+  });
+
+  it('freezes drop and final metadata with immutable retry bytes', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 500 }).mockResolvedValue({ ok: true });
+    vi.stubGlobal('fetch', fetchMock);
+    const config = resolveReplayConfig({ sessionSampleRate: 1, maxBufferSize: 900,
+      retryBaseDelayMs: 10, maxBackoffMs: 10 }, 'key', 'https://api.test');
+    const transport = new ReplayTransport(config, { compress: vi.fn(async (events: unknown[]) => {
+      const bytes = new TextEncoder().encode(JSON.stringify(events));
+      return { compressed: gzipSync(bytes), originalSize: bytes.length };
+    }) } as any);
+    transport.start(() => 'a'.repeat(32), () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent(snapshot(Date.now()));
+    const flushing = transport.flush(true);
+    await vi.advanceTimersByTimeAsync(1);
+    for (let i = 0; i < 100; i++) transport.addEvent({ type: 5, timestamp: Date.now() + i,
+      data: { tag: 'console-log', payload: { level: 'log' } } });
+    expect(transport.getStatus().droppedEvents).toBeGreaterThan(0);
+    await vi.advanceTimersByTimeAsync(20);
+    await flushing;
+    const first = fetchMock.mock.calls[0][1] as any;
+    const second = fetchMock.mock.calls[1][1] as any;
+    expect(first.headers['X-Replay-Final-Segment-Id']).toBe('0');
+    expect(first.headers['X-Replay-Dropped-Events']).toBe('0');
+    expect(second.headers).toEqual(first.headers);
+    expect(Buffer.from(second.body)).toEqual(Buffer.from(first.body));
+    transport.destroy();
+  });
+
+  it.each([true, false])('sends version and drops on %s beacon acceptance', async (accepted) => {
+    const beacon = vi.fn(() => accepted);
+    const fetchMock = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal('navigator', { sendBeacon: beacon });
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new ReplayTransport(resolveReplayConfig({ sessionSampleRate: 1 }, 'key', 'https://api.test'),
+      { compress: vi.fn() } as any);
+    transport.start(() => 'a'.repeat(32), () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent(snapshot(Date.now()));
+    transport.flushSync();
+    const [url, blob] = accepted ? beacon.mock.calls[0] : fetchMock.mock.calls[0];
+    const params = new URL(url).searchParams;
+    expect(params.get('protocol_version')).toBe('1');
+    expect(params.get('dropped_events')).toBe('0');
+    expect(params.has('final_segment_id')).toBe(false);
+    const body = accepted ? blob : (fetchMock.mock.calls[0][1] as any).body;
+    expect(JSON.parse(new TextDecoder().decode(gunzipSync(new Uint8Array(await body.arrayBuffer()))))).toHaveLength(1);
+    expect(transport.getStatus().acknowledgedChunks).toBe(accepted ? 0 : 1);
+    transport.destroy();
+  });
+
+  it('settles a synchronous segment callback error and permits a later flush', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new ReplayTransport(resolveReplayConfig({ sessionSampleRate: 1 }, 'key', 'https://api.test'),
+      { compress: vi.fn(async (events: unknown[]) => {
+        const bytes = new TextEncoder().encode(JSON.stringify(events));
+        return { compressed: gzipSync(bytes), originalSize: bytes.length };
+      }) } as any);
+    const segment = vi.fn().mockImplementationOnce(() => { throw new Error('unsafe'); }).mockReturnValueOnce(1);
+    transport.start(() => 'a'.repeat(32), segment, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent(snapshot(Date.now()));
+    await transport.flush();
+    expect(transport.getStatus().droppedChunks).toBe(1);
+    expect(transport.getStatus().queueChunks).toBe(0);
+    transport.addEvent(snapshot(Date.now() + 1));
+    await transport.flush();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(segment).toHaveBeenCalledTimes(2);
+    transport.destroy();
+  });
+
+  it('recovers after SessionManager rotates an unsafe segment counter', async () => {
+    const config = resolveReplayConfig({ sessionSampleRate: 1 }, 'key', 'https://api.test');
+    const manager = new SessionManager(config);
+    const initialId = manager.getFlushSessionId();
+    (manager as any).state.segmentId = 0x7fff_ffff;
+    const fetchMock = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new ReplayTransport(config, { compress: vi.fn(async (events: unknown[]) => {
+      const bytes = new TextEncoder().encode(JSON.stringify(events));
+      return { compressed: gzipSync(bytes), originalSize: bytes.length };
+    }) } as any);
+    transport.start(() => manager.getFlushSessionId(), () => manager.nextSegmentId(), () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent(snapshot(Date.now()));
+    await transport.flush();
+    expect(manager.getFlushSessionId()).not.toBe(initialId);
+    expect(transport.getStatus().droppedChunks).toBe(1);
+    transport.addEvent(snapshot(Date.now() + 1));
+    await transport.flush();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    manager.destroy();
+    transport.destroy();
+  });
   it('rejects nonfinite rates and clamps unsafe queue settings', () => {
     const config = resolveReplayConfig({
       sessionSampleRate: Number.NaN,
