@@ -1,6 +1,6 @@
 # @tracekit/replay
 
-Privacy-first session recording for TraceKit. Records DOM changes, network requests, and console output with all text and inputs masked by default. Replays are linked to distributed traces and errors automatically.
+Privacy-first session recording for TraceKit. Replay masks text and inputs by default. It strips URL credentials, queries, and fragments before upload. Server-side trace links require a validated same-organization relationship.
 
 ## Installation
 
@@ -29,6 +29,8 @@ replayIntegration({
   sessionSampleRate: 0.1,   // Record 10% of sessions
   errorSampleRate: 0.0,     // Capture replay on error (0.0 = off, 1.0 = all errors)
   unmask: ['.public-text'], // CSS selectors to unmask (default: everything masked)
+  block: ['.private-panel'], // Block these regions, including protected descendants
+  mask: ['.account-number'], // Mask these regions, even inside unmask targets
   idleTimeout: 1800000,     // End session after 30min inactivity
   flushInterval: 30000,     // Upload chunks every 30 seconds
   maxBufferSize: 24117248,  // 23MB max buffer before dropping oldest events
@@ -42,6 +44,8 @@ replayIntegration({
 | `sessionSampleRate` | `number` | `0.1` | Percentage of sessions to record (0.0 to 1.0) |
 | `errorSampleRate` | `number` | `0.0` | Capture replay when an error occurs (0.0 to 1.0) |
 | `unmask` | `string[]` | `[]` | CSS selectors for elements to unmask |
+| `block` | `string[]` | `[]` | CSS selectors for regions to block |
+| `mask` | `string[]` | `[]` | CSS selectors for regions to mask |
 | `idleTimeout` | `number` | `1800000` | Milliseconds without visible user activity before session ends (30 min) |
 | `flushInterval` | `number` | `30000` | Milliseconds between chunk uploads (30s) |
 | `maxBufferSize` | `number` | `24117248` | Max buffer size in bytes before dropping oldest events (23MB) |
@@ -52,7 +56,7 @@ replayIntegration({
 
 The SDK automatically sends session metadata with each chunk upload:
 
-- **Page URL** — current `window.location.href`
+- **Page URL** — current page URL without credentials, query, or fragment
 - **User ID** — from the browser SDK scope (`setUser()`)
 - **User-Agent** — for device, OS, and browser detection
 - **Click count** — accumulated mouse clicks in the session
@@ -70,6 +74,12 @@ replay.flush();
 
 // Get the current session ID (for linking to errors)
 replay.getSessionId();
+
+// Aggregate capture and delivery state. It contains no URL or recorded content.
+replay.getStatus();
+
+// Subscribe to aggregate state changes. Call the returned function to unsubscribe.
+const unsubscribe = replay.subscribeStatus((status) => console.log(status.captureState, status.deliveryState));
 
 // Stop capture and discard unsent replay data after permission withdrawal.
 replay.stop();
@@ -91,6 +101,13 @@ It also aborts active Replay fetches and prevents automatic visibility or input
 events from restarting recording. A request that the server already accepted
 cannot be recalled. `start()` is idempotent and checks Browser enablement.
 Each allowed start after a stop uses a fresh document-local Replay ID.
+Reloads and copied tabs also use a fresh ID. They do not restore a prior document ID.
+The first automatic pageview uses the same ID when recording starts successfully.
+
+`getStatus()` reports bounded counts and a reason. A beacon is queued, not acknowledged.
+Missing final or dropped-event evidence leaves recording health unknown or partial.
+The viewer marks unsupported legacy intervals and starts again at a real FullSnapshot.
+It does not display a known-wrong frame across a missing chunk.
 
 Replay uses owned breadcrumb subscriptions when the Browser SDK supports them.
 With older Browser bundles, Replay disables breadcrumb capture and reports a
@@ -116,6 +133,7 @@ Older uploads without boundaries keep an unknown duration.
 The server also marks chunks longer than 30 minutes as unknown.
 Keep `flushInterval` below that limit (default: 30 seconds).
 
-For the real Chromium lifecycle test, run `npm run build`, then
-`node tests/browser-lifecycle.integration.mjs` with Playwright installed.
+For the real Browser-bundle lifecycle test, build Browser and Replay first.
+Then run `npm run test:browser-lifecycle` with Playwright installed.
 Set `PLAYWRIGHT_MODULE` to its module path when using an external installation.
+The script reports unavailable engines instead of counting them as passing.
