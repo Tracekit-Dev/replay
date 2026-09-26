@@ -79,4 +79,29 @@ describe('actual FullSnapshot cadence', () => {
     transport.destroy();
     vi.unstubAllGlobals();
   });
+
+  it('does not accept a type 2 marker without a document node as the cadence snapshot', async () => {
+    const { transport, fetchMock } = fixture();
+    const request = vi.fn();
+    transport.setSnapshotRequest(request);
+    transport.addEvent(snapshot(1));
+    await transport.flush();
+    transport.addEvent(mutation(2));
+    await transport.flush();
+    transport.addEvent(mutation(3));
+    await transport.flush();
+    await Promise.resolve();
+    expect(request).toHaveBeenCalledOnce();
+    transport.addEvent({ type: 2, timestamp: 4 });
+    transport.addEvent(mutation(5));
+    transport.addEvent(snapshot(6));
+    transport.addEvent(mutation(7));
+    await transport.flush();
+    const last = uploadedEvents(fetchMock).at(-1)!;
+    expect(last.some((event: any) => event.timestamp === 5)).toBe(false);
+    expect(last.some((event: any) => event.timestamp === 6)).toBe(true);
+    expect(last.some((event: any) => event.timestamp === 7)).toBe(true);
+    transport.destroy();
+    vi.unstubAllGlobals();
+  });
 });
