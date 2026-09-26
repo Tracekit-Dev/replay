@@ -12,6 +12,7 @@ const DEFAULTS = {
   sessionSampleRate: 0.1,
   errorSampleRate: 0.0,
   unmask: [] as string[],
+  block: [] as string[],
   idleTimeout: 1_800_000, // 30 minutes
   flushInterval: 30_000, // 30 seconds
   maxBufferSize: 24_117_248, // 23MB
@@ -43,6 +44,7 @@ function resolveIdleTimeout(value: number | undefined): number {
  * Clamp a value to the [min, max] range, logging a warning if clamped.
  */
 function clampRate(value: number, name: string, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
   if (value < min) {
     console.warn(`[TraceKit Replay] ${name} (${value}) is below ${min}, clamping to ${min}`);
     return min;
@@ -52,6 +54,16 @@ function clampRate(value: number, name: string, min: number, max: number): numbe
     return max;
   }
   return value;
+}
+
+/** Reject malformed selectors before rrweb sees them. A bad block rule blocks all DOM. */
+function validSelector(value: unknown): value is string {
+  if (typeof value !== 'string' || !value || value.length > 256) return false;
+  try {
+    if (typeof document !== 'undefined') document.querySelector(value);
+    else if (/\[[^\]]*$|\([^\)]*$|[{}]/.test(value)) return false;
+    return true;
+  } catch { return false; }
 }
 
 /**
@@ -88,7 +100,8 @@ export function resolveReplayConfig(
   return {
     sessionSampleRate,
     errorSampleRate,
-    unmask: config.unmask ?? DEFAULTS.unmask,
+    unmask: (config.unmask ?? DEFAULTS.unmask).filter(validSelector),
+    block: (config.block ?? DEFAULTS.block).every(validSelector) ? [...(config.block ?? DEFAULTS.block)] : ['*'],
     idleTimeout: resolveIdleTimeout(config.idleTimeout),
     flushInterval: config.flushInterval ?? DEFAULTS.flushInterval,
     maxBufferSize: config.maxBufferSize ?? DEFAULTS.maxBufferSize,
