@@ -3,6 +3,7 @@ import { RingBuffer } from '../src/buffer';
 import { resolveReplayConfig } from '../src/config';
 import { ReplayTransport } from '../src/transport';
 import { SessionManager } from '../src/session';
+import { replayIntegration } from '../src/index';
 import { gunzipSync, gzipSync } from 'fflate';
 
 const snapshot = (timestamp: number, text = '') => ({
@@ -18,6 +19,11 @@ const mutation = (timestamp: number) => ({
   data: { source: 0, adds: [], texts: [{ id: 3, value: 'safe' }], attributes: [], removes: [] },
 });
 const byteSize = (event: unknown) => new TextEncoder().encode(JSON.stringify(event)).byteLength;
+const recorderBridge = vi.hoisted(() => ({ emit: null as null | ((event: unknown, checkout: boolean) => void) }));
+vi.mock('../src/recorder', () => ({ startRecording: vi.fn((_config, emit) => {
+  recorderBridge.emit = emit;
+  return () => {};
+}) }));
 
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
@@ -75,6 +81,24 @@ describe('bounded error history', () => {
     expect(restart).toHaveBeenCalledTimes(2);
     manager.destroy();
   });
+
+  it('requests one baseline after local-age expiry despite a future event timestamp', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_800_000_000_000);
+    const manager = new SessionManager(resolveReplayConfig({ sessionSampleRate: 0, errorSampleRate: 1 }, 'key', 'https://api.test'));
+    const restart = vi.fn();
+    const dropped = vi.fn();
+    manager.setRestartCallback(restart);
+    manager.setBufferDropCallback(dropped);
+    manager.onEvent(snapshot(Date.now() + 1_000_000), false);
+    await vi.advanceTimersByTimeAsync(60_001);
+    manager.onEvent(mutation(Date.now() + 1_000_000), false);
+    manager.onEvent(mutation(Date.now() + 1_000_001), false);
+    await Promise.resolve();
+    expect(restart).toHaveBeenCalledOnce();
+    expect(dropped).toHaveBeenCalled();
+    manager.destroy();
+  });
   it('counts serialized UTF-8 bytes and evicts complete snapshot regions', () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_800_000_000_000);
@@ -103,6 +127,75 @@ describe('bounded error history', () => {
 });
 
 describe('bounded delivery', () => {
+  it('marks the known idle terminal segment final', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_800_000_000_000);
+    const fetchMock = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal('fetch', fetchMock);
+    const scope = { getUser: () => null, getTags: () => ({}), setTag: () => {}, removeTag: () => {},
+      subscribeBreadcrumb: () => () => {} };
+    const client = { getConfig: () => ({ enabled: true, apiKey: 'key', endpoint: 'https://api.test' }),
+      getScope: () => scope, captureException: () => 'error' };
+    const replay = replayIntegration({ sessionSampleRate: 1, idleTimeout: 1000 });
+    replay.install(client);
+    recorderBridge.emit?.(snapshot(Date.now()), false);
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect((fetchMock.mock.calls[0][1] as any).headers['X-Replay-Final-Segment-Id']).toBe('0');
+    replay.teardown?.();
+  });
+
+  it('keeps a visibility pause and lost-close beacon nonfinal', () => {
+    const listeners = new Map<string, Set<() => void>>();
+    const doc = { visibilityState: 'visible',
+      addEventListener(name: string, listener: () => void) {
+        const group = listeners.get(name) ?? new Set();
+        group.add(listener);
+        listeners.set(name, group);
+      },
+      removeEventListener(name: string, listener: () => void) { listeners.get(name)?.delete(listener); },
+    };
+    vi.stubGlobal('document', doc);
+    const beacon = vi.fn(() => true);
+    vi.stubGlobal('navigator', { sendBeacon: beacon });
+    const scope = { getUser: () => null, getTags: () => ({}), setTag: () => {}, removeTag: () => {},
+      subscribeBreadcrumb: () => () => {} };
+    const client = { getConfig: () => ({ enabled: true, apiKey: 'key', endpoint: 'https://api.test' }),
+      getScope: () => scope, captureException: () => 'error' };
+    const replay = replayIntegration({ sessionSampleRate: 1 });
+    replay.install(client);
+    recorderBridge.emit?.(snapshot(Date.now()), false);
+    doc.visibilityState = 'hidden';
+    for (const listener of listeners.get('visibilitychange') ?? []) listener();
+    expect(beacon).toHaveBeenCalledOnce();
+    const params = new URL(beacon.mock.calls[0][0]).searchParams;
+    expect(params.get('protocol_version')).toBe('1');
+    expect(params.get('dropped_events')).toBe('0');
+    expect(params.has('final_segment_id')).toBe(false);
+    replay.teardown?.();
+  });
+
+  it('marks a known user-boundary segment final with its original identity', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal('fetch', fetchMock);
+    let userId = 'first';
+    const scope = { getUser: () => ({ id: userId }), getTags: () => ({}), setTag: () => {}, removeTag: () => {},
+      subscribeBreadcrumb: () => () => {} };
+    const client = { getConfig: () => ({ enabled: true, apiKey: 'key', endpoint: 'https://api.test' }),
+      getScope: () => scope, captureException: (_error: Error) => 'error' };
+    const replay = replayIntegration({ sessionSampleRate: 1 });
+    replay.install(client);
+    const firstId = replay.getSessionId();
+    recorderBridge.emit?.(snapshot(Date.now()), false);
+    userId = 'second';
+    client.captureException(new Error('synthetic'));
+    expect(replay.getSessionId()).not.toBe(firstId);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    expect(fetchMock.mock.calls[0][0]).toContain(firstId);
+    expect((fetchMock.mock.calls[0][1] as any).headers['X-Replay-Final-Segment-Id']).toBe('0');
+    replay.teardown?.();
+  });
+
   it('sends version and zero-drop evidence on periodic fetch without a final marker', async () => {
     const fetchMock = vi.fn(async () => ({ ok: true }));
     vi.stubGlobal('fetch', fetchMock);
@@ -152,6 +245,31 @@ describe('bounded delivery', () => {
     transport.destroy();
   });
 
+  it('reports cumulative drops for each session without carrying older losses forward', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal('fetch', fetchMock);
+    let identity = 'a'.repeat(32);
+    let segment = 0;
+    const transport = new ReplayTransport(resolveReplayConfig({ sessionSampleRate: 1 }, 'key', 'https://api.test'),
+      { compress: vi.fn(async (events: unknown[]) => {
+        const bytes = new TextEncoder().encode(JSON.stringify(events));
+        return { compressed: gzipSync(bytes), originalSize: bytes.length };
+      }) } as any);
+    transport.start(() => identity, () => segment++, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.recordDroppedEvents(4, 40);
+    transport.addEvent(snapshot(Date.now()));
+    await transport.flush();
+    identity = 'b'.repeat(32);
+    segment = 0;
+    transport.setSessionIdentity(identity);
+    transport.recordDroppedEvents(1, 10);
+    transport.addEvent(snapshot(Date.now() + 1));
+    await transport.flush();
+    expect(fetchMock.mock.calls.map((call) => (call[1] as any).headers['X-Replay-Dropped-Events'])).toEqual(['4', '1']);
+    transport.destroy();
+  });
+
   it.each([true, false])('sends version and drops on %s beacon acceptance', async (accepted) => {
     const beacon = vi.fn(() => accepted);
     const fetchMock = vi.fn(async () => ({ ok: true }));
@@ -159,6 +277,7 @@ describe('bounded delivery', () => {
     vi.stubGlobal('fetch', fetchMock);
     const transport = new ReplayTransport(resolveReplayConfig({ sessionSampleRate: 1 }, 'key', 'https://api.test'),
       { compress: vi.fn() } as any);
+    transport.recordDroppedEvents(7, 70);
     transport.start(() => 'a'.repeat(32), () => 0, () => 'session', () => '', () => '');
     transport.stop();
     transport.addEvent(snapshot(Date.now()));
@@ -166,7 +285,7 @@ describe('bounded delivery', () => {
     const [url, blob] = accepted ? beacon.mock.calls[0] : fetchMock.mock.calls[0];
     const params = new URL(url).searchParams;
     expect(params.get('protocol_version')).toBe('1');
-    expect(params.get('dropped_events')).toBe('0');
+    expect(params.get('dropped_events')).toBe('7');
     expect(params.has('final_segment_id')).toBe(false);
     const body = accepted ? blob : (fetchMock.mock.calls[0][1] as any).body;
     expect(JSON.parse(new TextDecoder().decode(gunzipSync(new Uint8Array(await body.arrayBuffer()))))).toHaveLength(1);
