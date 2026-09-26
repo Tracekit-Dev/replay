@@ -37,7 +37,7 @@ describe('privacy sanitizer', () => {
       expect(bytes).not.toContain('#app');
       expect(bytes).not.toContain('class":"panel');
       const rebuilt = new page.Document();
-      rebuild(safe.data.node, { doc: rebuilt, mirror: createMirror() });
+      rebuild(JSON.parse(JSON.stringify(safe.data.node)), { doc: rebuilt, mirror: createMirror() });
       const button = rebuilt.querySelector('button')!;
       const panel = button.parentElement!;
       expect(panel.className).not.toBe('panel');
@@ -65,6 +65,9 @@ describe('privacy sanitizer', () => {
     expect(JSON.stringify(changed)).toContain('500px');
     expect(JSON.stringify(changed)).not.toContain('synthetic-secret-canary');
     expect(changed.data.attributes[0].attributes.class).toBe(base.data.node.childNodes[0].attributes.class);
+    const styleObject = sanitizer.sanitize({ type: 3, timestamp: 5, data: { source: 0, adds: [], texts: [], attributes: [{ id: 2, attributes: { style: { display: 'grid', width: ['500px', ''], content: 'synthetic-secret-canary' } } }], removes: [] } });
+    expect(styleObject?.data?.attributes?.[0]?.attributes?.style).toContain('width:500px');
+    expect(JSON.stringify(styleObject)).not.toContain('synthetic-secret-canary');
   });
   it('rejects malformed snapshot tags and attributes without granting a valid unmask rule', () => {
     const resolved = resolveReplayConfig({ unmask: ['.public'] }, 'test-key', 'https://api.test');
@@ -105,6 +108,15 @@ describe('privacy sanitizer', () => {
       expect(sanitizer.sanitize({ type: 3, timestamp: 3, data: { source: 0, adds: [], texts: [{ id: 3, value: 'synthetic-secret-canary' }], attributes: [], removes: [] } })).toBeNull();
     } finally { vi.stubGlobal('document', previousDocument); }
     expect(JSON.stringify(sanitizer.sanitize({ ...good, timestamp: 4 }))).toContain('allowed');
+  });
+
+  it('rejects malformed attribute mutations and clears protected ancestry', () => {
+    const sanitizer = new ReplayPrivacySanitizer(resolveReplayConfig({ unmask: ['.public'] }, 'test-key', 'https://api.test'));
+    sanitizer.sanitize({ type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
+      { type: 2, id: 2, tagName: 'div', attributes: { class: 'public' }, childNodes: [{ type: 3, id: 3, textContent: 'allowed' }] },
+    ] } } });
+    expect(sanitizer.sanitize({ type: 3, timestamp: 2, data: { source: 0, adds: [], texts: [], attributes: [{ id: 2, attributes: { 'bad>attribute': 'synthetic-secret-canary' } }], removes: [] } })).toBeNull();
+    expect(sanitizer.sanitize({ type: 3, timestamp: 3, data: { source: 0, adds: [], texts: [{ id: 3, value: 'synthetic-secret-canary' }], attributes: [], removes: [] } })).toBeNull();
   });
   it('removes credentials, query strings, and fragments from URL fields', () => {
     expect(sanitizeReplayUrl('https://user:secret@example.test/path?token=canary#canary')).toBe('https://example.test/path');

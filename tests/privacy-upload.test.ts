@@ -45,6 +45,7 @@ describe('serialized privacy upload paths', () => {
     ] } } };
     instance.addEvent(malformed);
     instance.addEvent({ type: 3, timestamp: 2, data: { source: 0, adds: [{ parentId: 2, nextId: null, node: { type: 2, id: 4, tagName: 'div', attributes: { 'bad>attribute': canary }, childNodes: [{ type: 3, id: 5, textContent: canary }] } }], texts: [], attributes: [], removes: [] } });
+    instance.addEvent({ type: 2, timestamp: 3, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 10, childNodes: [] } } });
     instance.addEvent(urlEvent);
     const pending = instance.flush();
     await vi.runAllTimersAsync();
@@ -65,6 +66,7 @@ describe('serialized privacy upload paths', () => {
     instance.addEvent({ type: 2, timestamp: 1, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 1, childNodes: [
       { type: 2, id: 2, tagName: 'div>', attributes: { class: 'not-public', 'bad>attribute': canary }, childNodes: [{ type: 3, id: 3, textContent: canary }] },
     ] } } });
+    instance.addEvent({ type: 2, timestamp: 3, data: { initialOffset: { top: 0, left: 0 }, node: { type: 0, id: 10, childNodes: [] } } });
     instance.addEvent(urlEvent);
     instance.flushSync();
     expect(beacon).toHaveBeenCalledTimes(1);
