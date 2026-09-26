@@ -129,6 +129,19 @@ describe('bounded replay queues', () => {
     transport.destroy();
   });
 
+  it('drops initial buffer-mode mutations until a snapshot arrives', async () => {
+    let mode = 'buffer';
+    const worker = { compress: vi.fn(async () => ({ compressed: new Uint8Array([1]), originalSize: 1 })) };
+    const transport = new ReplayTransport(resolveReplayConfig({}, 'buffer-initial', 'https://example.test'), worker as any);
+    transport.start(() => 'session', () => 0, () => mode, () => '', () => '');
+    transport.stop();
+    transport.addEvent({ type: 3, timestamp: Date.now() });
+    await transport.flush();
+    expect(worker.compress).not.toHaveBeenCalled();
+    mode = 'session';
+    transport.destroy();
+  });
+
   it('stops an oversized baseline region until a fresh snapshot arrives', () => {
     const worker = { compress: vi.fn() };
     const transport = new ReplayTransport(resolveReplayConfig({ maxBufferSize: 128 }, 'key', 'https://example.test'), worker as any);

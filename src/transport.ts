@@ -422,7 +422,7 @@ export class ReplayTransport {
     this.activeChunkBytes += chunkBytes;
     this.publish('chunk_queued');
     if (flushedBufferedHistory) this.awaitingSnapshot = true;
-    if (this.awaitingSnapshot && this.replayTypeFn?.() === 'buffer') {
+    if (this.replayTypeFn?.() === 'buffer' && (this.awaitingSnapshot || !events.some((event) => event?.type === 2))) {
       this.status.droppedEvents += events.length;
       this.outcome('dropped', 'snapshot_required');
       this.activeChunkBytes -= chunkBytes;
@@ -526,7 +526,7 @@ export class ReplayTransport {
       };
       const { sessionId, segmentId, mode: replayType } = allocation;
 
-      if (this.awaitingSnapshot && replayType === 'buffer') {
+      if (replayType === 'buffer' && (this.awaitingSnapshot || !events.some((event) => event?.type === 2))) {
         this.status.droppedEvents += events.length;
         this.outcome('dropped', 'snapshot_required');
         return;
