@@ -10,13 +10,14 @@ vi.mock('../src/recorder', () => ({
   }),
 }));
 
-function client(enabled = true, withSubscription = true) {
-  const tags = new Map([['replay_id', 'host-value']]);
+function client(enabled = true, withSubscription = true, withTag = true) {
+  const tags = new Map(withTag ? [['replay_id', 'host-value']] : []);
   const listeners = new Set<(crumb: any) => void>();
   const scope = {
     getUser: () => null,
     getTags: () => Object.fromEntries(tags),
     setTag: (name: string, value: string) => { tags.set(name, value); },
+    removeTag: (name: string) => { tags.delete(name); },
     ...(withSubscription ? { subscribeBreadcrumb: (listener: (crumb: any) => void) => {
       listeners.add(listener); return () => { listeners.delete(listener); };
     } } : {}),
@@ -102,7 +103,34 @@ describe('Replay privacy lifecycle', () => {
     const replay = replayIntegration({ sessionSampleRate: 1 });
     replay.install(host);
     await vi.waitFor(() => expect(recorder.starts).toBe(1));
-    expect(warning.mock.calls.some(([value]) => String(value).includes('breadcrumb'))).toBe(true);
+    expect(warning.mock.calls.some(([value]) => String(value).toLowerCase().includes('breadcrumb'))).toBe(true);
     replay.teardown?.();
+  });
+
+  it('restores an absent replay tag after error capture', async () => {
+    const host = client(true, true, false);
+    const replay = replayIntegration({ sessionSampleRate: 1 });
+    replay.install(host);
+    await vi.waitFor(() => expect(recorder.starts).toBe(1));
+    host.captureException(new Error('synthetic'));
+    expect(host.tags.has('replay_id')).toBe(false);
+    replay.teardown?.();
+  });
+
+  it('reinitializes without retaining a second recorder or changing the host error method', async () => {
+    const firstHost = client();
+    const first = replayIntegration({ sessionSampleRate: 1 });
+    first.install(firstHost);
+    await vi.waitFor(() => expect(recorder.starts).toBe(1));
+    const oldId = first.getSessionId();
+    first.teardown?.();
+    expect(firstHost.captureException).toBe(firstHost.original);
+    const secondHost = client();
+    const second = replayIntegration({ sessionSampleRate: 1 });
+    second.install(secondHost);
+    await vi.waitFor(() => expect(recorder.starts).toBe(2));
+    expect(recorder.stops).toBe(1);
+    expect(second.getSessionId()).not.toBe(oldId);
+    second.teardown?.();
   });
 });
