@@ -55,22 +55,48 @@ export function replayIntegration(
       try {
         // Resolve config with client's apiKey and endpoint
         const clientConfig = client.getConfig();
-        resolvedConfig = resolveReplayConfig(config, clientConfig.apiKey, clientConfig.endpoint);
+        resolvedConfig = {
+          ...resolveReplayConfig(config, clientConfig.apiKey, clientConfig.endpoint),
+          serviceName: clientConfig.serviceName || '',
+        };
+        const ownedConfig = resolvedConfig;
 
         // Create session manager (makes sampling decision)
-        session = new SessionManager(resolvedConfig);
+        session = new SessionManager(ownedConfig);
+        const ownedSession = session;
+        void ownedSession.ready().then(() => {
+          if (session !== ownedSession) return;
+          try {
 
         // Create compression worker (Web Worker with main-thread fallback)
         compressionWorker = new CompressionWorker();
 
         // Create transport (30-second flush interval, retry, sendBeacon fallback)
-        transport = new ReplayTransport(resolvedConfig, compressionWorker);
+        transport = new ReplayTransport(ownedConfig, compressionWorker);
+
+        const currentUserId = (): string => {
+          try { return client.getScope().getUser()?.id || ''; }
+          catch { return ''; }
+        };
+        let recordingUserId = currentUserId();
+        let rotatingUser = false;
 
         const start = () => {
           if (!session || !resolvedConfig || !session.isActive() || !session.isVisible() || session.getMode() === 'off') return;
           if (stopRecording) return;
+          if (currentUserId() !== recordingUserId) {
+            transport?.flush().catch(() => {});
+            session.rotateIdentity();
+            recordingUserId = currentUserId();
+          }
+          if (session.getMode() === 'off' || !session.getSessionId()) return;
           transport!.startRecordingWindow();
-          stopRecording = startRecording(resolvedConfig, (event, isCheckout) => {
+          stopRecording = startRecording(ownedConfig, (event, isCheckout) => {
+            if (rotatingUser) return;
+            if (currentUserId() !== recordingUserId) {
+              ensureUserBoundary();
+              return; // The new recorder supplies a full snapshot for the new user.
+            }
             session?.onEvent(event, isCheckout);
           });
           if (!stopRecording) transport!.stopRecordingWindow();
@@ -81,6 +107,17 @@ export function replayIntegration(
             stopRecording = null;
           }
           transport?.stopRecordingWindow();
+        };
+        const ensureUserBoundary = () => {
+          if (!session || rotatingUser || currentUserId() === recordingUserId) return;
+          rotatingUser = true;
+          try {
+            stop();
+            transport?.flush().catch(() => {}); // Captures old ID and user before rotation.
+            session.rotateIdentity();
+            recordingUserId = currentUserId();
+          } finally { rotatingUser = false; }
+          start();
         };
 
         // Wire session -> transport: events flow from session to transport
@@ -97,6 +134,7 @@ export function replayIntegration(
         // in OTLP output -- extras would prefix it as "extra.replay_id".
         const originalCaptureException = client.captureException.bind(client);
         client.captureException = function (error: Error, context?: any): string {
+          ensureUserBoundary();
           const replayId = session?.getSessionId() ?? '';
           const scope = client.getScope();
           if (replayId) {
@@ -186,17 +224,20 @@ export function replayIntegration(
           // URL: current page location
           () => typeof window !== 'undefined' ? window.location.href : '',
           // User ID: from browser SDK scope
-          () => {
-            try {
-              const scope = client.getScope();
-              return scope.getUser()?.id || '';
-            } catch { return ''; }
-          },
-          () => session!.getState().lastActivity + resolvedConfig!.idleTimeout,
+          () => recordingUserId,
+          () => session!.getState().lastActivity + ownedConfig.idleTimeout,
         );
 
         // Start recording immediately (LOCKED: recording starts on init())
         start();
+          } catch (err) {
+            console.warn('[TraceKit Replay] Failed to initialize replay recording:', err);
+            integration.teardown?.();
+          }
+        }).catch((err) => {
+          console.warn('[TraceKit Replay] Failed to establish replay identity:', err);
+          integration.teardown?.();
+        });
       } catch (err) {
         console.warn('[TraceKit Replay] Failed to initialize replay recording:', err);
       }

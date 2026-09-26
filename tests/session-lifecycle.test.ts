@@ -19,7 +19,17 @@ class FakeDocument {
 }
 
 function config(): ResolvedReplayConfig {
-  return { sessionSampleRate: 1, errorSampleRate: 0, unmask: [], idleTimeout: 1_000, flushInterval: 30_000, maxBufferSize: 1000, inlineImages: false, blockMedia: true, apiKey: 'key', endpoint: 'http://localhost' };
+  return { sessionSampleRate: 1, errorSampleRate: 0, unmask: [], idleTimeout: 1_000, flushInterval: 30_000, maxBufferSize: 1000, inlineImages: false, blockMedia: true, apiKey: 'key', endpoint: 'http://localhost', serviceName: 'test' };
+}
+
+class FakeLocks {
+  held = new Set<string>();
+  async request(name: string, _options: { ifAvailable: boolean }, callback: (lock: object | null) => Promise<void>) {
+    const available = !this.held.has(name);
+    if (available) this.held.add(name);
+    try { await callback(available ? {} : null); }
+    finally { if (available) this.held.delete(name); }
+  }
 }
 
 describe('SessionManager lifecycle', () => {
@@ -33,12 +43,15 @@ describe('SessionManager lifecycle', () => {
     doc.visibilityState = 'visible';
   });
 
-  it('expires after 30 minutes despite rrweb DOM and custom events for 800 minutes', () => {
+  const useLocks = () => vi.stubGlobal('navigator', { locks: new FakeLocks() });
+
+  it('expires after 30 minutes despite rrweb DOM and custom events for 800 minutes', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     vi.stubGlobal('document', doc);
     vi.stubGlobal('sessionStorage', { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) });
     const manager = new SessionManager({ ...config(), idleTimeout: 30 * 60 * 1_000 });
+    await manager.ready();
     let restarts = 0;
     manager.setRestartCallback(() => { restarts++; });
     for (let minute = 0; minute < 800; minute++) {
@@ -52,12 +65,13 @@ describe('SessionManager lifecycle', () => {
     manager.destroy();
   });
 
-  it('renews on trusted input and resumes once after an expired hidden period', () => {
+  it('renews on trusted input and resumes once after an expired hidden period', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     vi.stubGlobal('document', doc);
     vi.stubGlobal('sessionStorage', { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) });
     const manager = new SessionManager(config());
+    await manager.ready();
     let starts = 0;
     let resumes = 0;
     manager.setRestartCallback(() => { starts++; });
@@ -77,45 +91,53 @@ describe('SessionManager lifecycle', () => {
     manager.destroy();
   });
 
-  it('persists segment allocation and removes all listeners on destroy', () => {
+  it('persists segment allocation and removes all listeners on destroy', async () => {
+    useLocks();
     vi.stubGlobal('document', doc);
     vi.stubGlobal('sessionStorage', { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) });
     const manager = new SessionManager(config());
+    await manager.ready();
     expect(manager.nextSegmentId()).toBe(0);
-    expect(JSON.parse(storage.get('__tracekit_replay_session')!).segmentId).toBe(1);
+    const key = [...storage.keys()].find((item) => item.startsWith('__tracekit_replay_session_v2_'))!;
+    expect(JSON.parse(storage.get(key)!).segmentId).toBe(1);
     expect(doc.count('pointerdown')).toBe(1);
     manager.destroy();
     expect(doc.count('pointerdown')).toBe(0);
   });
 
-  it('preserves off sampling and segment state across reload', () => {
+  it('preserves off sampling and segment state across reload when ownership is proven', async () => {
+    useLocks();
     vi.stubGlobal('document', doc);
     vi.stubGlobal('sessionStorage', { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) });
     const first = new SessionManager({ ...config(), sessionSampleRate: 0, errorSampleRate: 0 });
+    await first.ready();
     expect(first.getMode()).toBe('off');
     first.nextSegmentId();
     first.destroy();
     const second = new SessionManager({ ...config(), sessionSampleRate: 1 });
+    await second.ready();
     expect(second.getMode()).toBe('off');
     expect(second.nextSegmentId()).toBe(1);
     second.destroy();
   });
 
-  it('starts inactive when the initial document is hidden', () => {
+  it('starts inactive when the initial document is hidden', async () => {
     doc.visibilityState = 'hidden';
     vi.stubGlobal('document', doc);
     vi.stubGlobal('sessionStorage', { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) });
     const manager = new SessionManager(config());
+    await manager.ready();
     expect(manager.isActive()).toBe(false);
     manager.destroy();
   });
 
-  it('flushes the old identity before trusted input creates a new session', () => {
+  it('flushes the old identity before trusted input creates a new session', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     vi.stubGlobal('document', doc);
     vi.stubGlobal('sessionStorage', { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) });
     const manager = new SessionManager(config());
+    await manager.ready();
     const oldId = manager.getFlushSessionId();
     let flushed = '';
     manager.setFlushCallback(() => { flushed = manager.getFlushSessionId(); });
@@ -129,12 +151,13 @@ describe('SessionManager lifecycle', () => {
     manager.destroy();
   });
 
-  it('creates a fresh baseline when a delayed buffer error has no retained events', () => {
+  it('creates a fresh baseline when a delayed buffer error has no retained events', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     vi.stubGlobal('document', doc);
     vi.stubGlobal('sessionStorage', { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) });
     const manager = new SessionManager({ ...config(), sessionSampleRate: 0, errorSampleRate: 1, idleTimeout: 120_000 });
+    await manager.ready();
     const emitted: any[] = [];
     let restarts = 0;
     manager.setEventCallback((events) => emitted.push(...events));

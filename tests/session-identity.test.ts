@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SessionManager } from '../src/session';
+import { replayIntegration } from '../src/index';
 import type { ResolvedReplayConfig } from '../src/types';
+
+const recorderCalls = vi.hoisted(() => ({ count: 0 }));
+vi.mock('../src/recorder', () => ({
+  startRecording: vi.fn(() => { recorderCalls.count++; return () => {}; }),
+}));
 
 const config = (serviceName = 'alpha', apiKey = 'public-key'): ResolvedReplayConfig => ({
   sessionSampleRate: 1, errorSampleRate: 0, unmask: [], idleTimeout: 1_800_000,
@@ -84,6 +90,7 @@ describe('Replay session identity', () => {
     const original = storage();
     const locks = new FakeLocks();
     vi.stubGlobal('navigator', { locks });
+    vi.stubGlobal('BroadcastChannel', undefined);
     vi.stubGlobal('sessionStorage', original);
     const first = await createManager();
     first.nextSegmentId();
@@ -132,5 +139,53 @@ describe('Replay session identity', () => {
     expect(reload.getSessionId()).toBe(id);
     expect(reload.nextSegmentId()).toBe(1);
     reload.destroy();
+  });
+
+  it('does not allocate a segment before ownership settles', async () => {
+    vi.stubGlobal('sessionStorage', storage());
+    vi.stubGlobal('navigator', { locks: new FakeLocks() });
+    const manager = new SessionManager(config());
+    expect(() => manager.nextSegmentId()).toThrow('Replay identity is not ready');
+    await manager.ready();
+    expect(manager.nextSegmentId()).toBe(0);
+    manager.destroy();
+  });
+
+  it('rotates instead of emitting an unsafe next counter', async () => {
+    const shared = storage();
+    vi.stubGlobal('sessionStorage', shared);
+    vi.stubGlobal('navigator', { locks: new FakeLocks() });
+    const first = await createManager();
+    const key = [...shared.values.keys()][0];
+    first.destroy();
+    const previous = JSON.parse(shared.values.get(key)!);
+    shared.values.set(key, JSON.stringify({ ...previous, segmentId: 0x7fff_fffe }));
+    const manager = await createManager();
+    const oldId = manager.getSessionId();
+    expect(manager.nextSegmentId()).toBe(0x7fff_fffe);
+    expect(() => manager.nextSegmentId()).toThrow('Replay segment counter is unsafe');
+    expect(manager.getSessionId()).not.toBe(oldId);
+    manager.destroy();
+  });
+
+  it('rotates recording identity when the BrowserClient user changes', async () => {
+    vi.stubGlobal('sessionStorage', storage());
+    vi.stubGlobal('navigator', { locks: new FakeLocks() });
+    let userId = 'first';
+    const scope = { getUser: () => ({ id: userId }), setTag: vi.fn(), onBreadcrumb: vi.fn() };
+    const client = {
+      getConfig: () => ({ apiKey: 'public-key', endpoint: 'https://example.test', serviceName: 'alpha' }),
+      getScope: () => scope,
+      captureException: vi.fn(() => 'event-id'),
+    };
+    const integration = replayIntegration({ sessionSampleRate: 1 });
+    integration.install(client);
+    await vi.waitFor(() => expect(integration.getSessionId()).toMatch(/^[0-9a-f]{32}$/));
+    const firstId = integration.getSessionId();
+    userId = 'second';
+    client.captureException(new Error('synthetic'));
+    expect(integration.getSessionId()).not.toBe(firstId);
+    expect(recorderCalls.count).toBeGreaterThanOrEqual(2);
+    integration.teardown?.();
   });
 });

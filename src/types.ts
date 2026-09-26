@@ -72,6 +72,8 @@ export interface ResolvedReplayConfig {
   apiKey: string;
   /** Inherited from BrowserClient */
   endpoint: string;
+  /** BrowserClient service discriminator. Empty means no persistent replay identity. */
+  serviceName?: string;
 }
 
 // ============================================================================
