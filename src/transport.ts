@@ -25,6 +25,15 @@ const MAX_ATTEMPTS = 3;
 // sendBeacon has a ~64KB payload limit
 const BEACON_SIZE_LIMIT = 65536;
 
+// A service name is only a lookup hint. The server makes the scope decision.
+function boundedServiceName(name: string | undefined): string {
+  const value = name?.trim() ?? '';
+  if (!value || new TextEncoder().encode(value).byteLength > 255 || /[\u0000-\u001f\u007f]/.test(value)) {
+    return '';
+  }
+  return value;
+}
+
 export class ReplayTransport {
   private pendingEvents: any[] = [];
   private flushTimer: ReturnType<typeof setInterval> | null = null;
@@ -266,6 +275,7 @@ export class ReplayTransport {
       // Build URL with query parameters (sendBeacon cannot set custom headers)
       const replayUrl = this.urlFn ? this.urlFn() : '';
       const replayUserId = this.userIdFn ? this.userIdFn() : '';
+      const serviceName = boundedServiceName(this.config.serviceName);
       const url =
         `${this.config.endpoint}/api/replays/${sessionId}/chunks` +
         `?api_key=${encodeURIComponent(this.config.apiKey)}` +
@@ -275,7 +285,8 @@ export class ReplayTransport {
         `&replay_url=${encodeURIComponent(replayUrl)}` +
         `&replay_user_id=${encodeURIComponent(replayUserId)}` +
         `&click_count=${this.clickCount}` +
-        `&keypress_count=${this.keypressCount}`;
+        `&keypress_count=${this.keypressCount}` +
+        (serviceName ? `&service_name=${encodeURIComponent(serviceName)}` : '');
 
       // Cast through ArrayBuffer to satisfy TypeScript 5.x Uint8Array<ArrayBufferLike> vs BlobPart
       const blob = new Blob([compressed as unknown as BlobPart], { type: 'application/octet-stream' });
@@ -357,7 +368,7 @@ export class ReplayTransport {
 
   /** Capture metadata before compression or retries can cross a session boundary. */
   private uploadHeaders(segmentId: number): Record<string, string> {
-    return {
+    const headers: Record<string, string> = {
       'Content-Type': 'application/octet-stream',
       'X-API-Key': this.config.apiKey,
       'X-Segment-Id': String(segmentId),
@@ -368,6 +379,9 @@ export class ReplayTransport {
       'X-Click-Count': String(this.clickCount),
       'X-Keypress-Count': String(this.keypressCount),
     };
+    const serviceName = boundedServiceName(this.config.serviceName);
+    if (serviceName) headers['X-Replay-Service-Name'] = serviceName;
+    return headers;
   }
 
   /**
