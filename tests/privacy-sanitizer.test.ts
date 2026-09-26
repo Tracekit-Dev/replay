@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { resolveReplayConfig } from '../src/config';
 import { ReplayPrivacySanitizer, sanitizeReplayEvent, sanitizeReplayUrl } from '../src/privacy';
 import { startRecording } from '../src/recorder';
+import { Window } from 'happy-dom';
 
 const recordMock = vi.hoisted(() => vi.fn(() => () => {}));
 vi.mock('rrweb', () => ({ record: recordMock }));
@@ -9,6 +10,62 @@ vi.mock('rrweb', () => ({ record: recordMock }));
 const config = () => resolveReplayConfig({ unmask: ['.public'], block: ['.secret'] }, 'test-key', 'https://api.test');
 
 describe('privacy sanitizer', () => {
+  it('rebuilds an actual rrweb snapshot with stable safe selectors and layout', async () => {
+    const page = new Window({ url: 'https://fixture.test/page?token=synthetic-secret-canary' });
+    vi.stubGlobal('window', page);
+    vi.stubGlobal('document', page.document);
+    vi.stubGlobal('location', page.location);
+    for (const name of Object.getOwnPropertyNames(page)) {
+      if (/^(HTML|SVG|CSS|Node$|Element$|Document$|ShadowRoot$)/.test(name) && typeof (page as any)[name] === 'function') {
+        vi.stubGlobal(name, (page as any)[name]);
+      }
+    }
+    try {
+      const { snapshot, rebuild, createMirror } = await import('rrweb-snapshot');
+      page.document.body.innerHTML = `
+        <style>#app .panel { display:grid; width:500px; background-image:url("https://user:synthetic-secret-canary@cdn.test/image?token=synthetic-secret-canary#synthetic-secret-canary"); }
+          #app .button { position:absolute; left:12px; content:"synthetic-secret-canary"; }</style>
+        <div id="app"><div class="panel" data-secret="synthetic-secret-canary"><button class="button" style="position:absolute;left:12px;content:'synthetic-secret-canary'">Secret</button></div></div>`;
+      const captured = snapshot(page.document, { inlineStylesheet: true, maskTextSelector: '*', maskAllInputs: true });
+      expect(captured).not.toBeNull();
+      expect(JSON.stringify(captured)).toContain('_cssText');
+      const sanitizer = new ReplayPrivacySanitizer(config());
+      const safe = sanitizer.sanitize({ type: 2, timestamp: 1, data: { node: captured, initialOffset: { top: 0, left: 0 } } });
+      expect(safe).not.toBeNull();
+      const bytes = JSON.stringify(safe);
+      expect(bytes).not.toContain('synthetic-secret-canary');
+      expect(bytes).not.toContain('#app');
+      expect(bytes).not.toContain('class":"panel');
+      const rebuilt = new page.Document();
+      rebuild(safe.data.node, { doc: rebuilt, mirror: createMirror() });
+      const button = rebuilt.querySelector('button')!;
+      const panel = button.parentElement!;
+      expect(panel.className).not.toBe('panel');
+      expect(panel.parentElement?.id).not.toBe('app');
+      expect(page.getComputedStyle(panel).display).toBe('grid');
+      expect(page.getComputedStyle(panel).width).toBe('500px');
+      expect(page.getComputedStyle(button).position).toBe('absolute');
+    } finally { vi.unstubAllGlobals(); await page.happyDOM.abort(); }
+  });
+
+  it('sanitizes stylesheet, declaration, and selector mutations without losing layout values', () => {
+    const sanitizer = new ReplayPrivacySanitizer(config());
+    const base = sanitizer.sanitize({ type: 2, timestamp: 1, data: { node: { type: 0, id: 1, childNodes: [
+      { type: 2, id: 2, tagName: 'div', attributes: { id: 'app', class: 'panel', style: 'display:grid;width:500px;content:"synthetic-secret-canary"' }, childNodes: [] },
+    ] }, initialOffset: { top: 0, left: 0 } } });
+    expect(JSON.stringify(base)).not.toContain('synthetic-secret-canary');
+    const styleRule = sanitizer.sanitize({ type: 3, timestamp: 2, data: { source: 8, id: 5, adds: [{ rule: '#app .panel { display:grid; width:500px; content:"synthetic-secret-canary"; }', index: 0 }] } });
+    expect(styleRule).not.toBeNull();
+    expect(JSON.stringify(styleRule)).toContain('500px');
+    expect(JSON.stringify(styleRule)).not.toContain('synthetic-secret-canary');
+    expect(JSON.stringify(styleRule)).not.toContain('#app');
+    const declaration = sanitizer.sanitize({ type: 3, timestamp: 3, data: { source: 13, id: 2, index: [0], set: { property: 'position', value: 'absolute', priority: '' } } });
+    expect(declaration?.data?.set?.value).toBe('absolute');
+    const changed = sanitizer.sanitize({ type: 3, timestamp: 4, data: { source: 0, adds: [], texts: [], attributes: [{ id: 2, attributes: { class: 'panel', id: 'app', style: 'width:500px;content:"synthetic-secret-canary"', _cssText: '#app .panel { display:grid; width:500px; content:"synthetic-secret-canary"; }' } }], removes: [] } });
+    expect(JSON.stringify(changed)).toContain('500px');
+    expect(JSON.stringify(changed)).not.toContain('synthetic-secret-canary');
+    expect(changed.data.attributes[0].attributes.class).toBe(base.data.node.childNodes[0].attributes.class);
+  });
   it('rejects malformed snapshot tags and attributes without granting a valid unmask rule', () => {
     const resolved = resolveReplayConfig({ unmask: ['.public'] }, 'test-key', 'https://api.test');
     const realDocument = globalThis.document;
