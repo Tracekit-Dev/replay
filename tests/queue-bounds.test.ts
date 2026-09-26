@@ -167,7 +167,8 @@ describe('bounded replay queues', () => {
 
   it('blocks recorder mutations after privacy rejects a session baseline', async () => {
     const worker = { compress: vi.fn(async (events: any[]) => ({ compressed: new Uint8Array([1]), originalSize: events.length })) };
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 202 })));
+    const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+    vi.stubGlobal('fetch', fetchMock);
     const config = resolveReplayConfig({}, 'recorder-baseline', 'https://example.test');
     const transport = new ReplayTransport(config, worker as any);
     transport.start(() => 'session', () => 0, () => 'session', () => '', () => '');
@@ -179,12 +180,14 @@ describe('bounded replay queues', () => {
     emit({ type: 3, timestamp: Date.now() + 1, data: { source: 2, type: 2 } }, false);
     await transport.flush();
     expect(worker.compress).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
     expect(transport.getStatus().acknowledgedChunks).toBe(0);
 
     emit({ type: 2, timestamp: Date.now() + 2, data: { node: { type: 1, tagName: 'main' } } }, false);
     emit({ type: 3, timestamp: Date.now() + 3, data: { source: 2, type: 2 } }, false);
     await transport.flush();
     expect(worker.compress).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     transport.destroy();
   });
 
