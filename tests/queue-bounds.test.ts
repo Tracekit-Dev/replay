@@ -119,4 +119,46 @@ describe('bounded delivery', () => {
     expect(payloads.length).toBeLessThanOrEqual(2);
     transport.destroy();
   });
+
+  it('expires a dependent region and requests one fresh snapshot', async () => {
+    vi.useFakeTimers();
+    const config = resolveReplayConfig({ maxBufferSize: 2000, maxBufferAgeMs: 10 }, 'key', 'https://api.test');
+    const transport = new ReplayTransport(config, { compress: vi.fn() } as any);
+    const request = vi.fn();
+    transport.setSnapshotRequest(request);
+    transport.start(() => 'a'.repeat(32), () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent(snapshot(Date.now()));
+    await vi.advanceTimersByTimeAsync(11);
+    transport.addEvent(mutation(Date.now()));
+    transport.addEvent(mutation(Date.now() + 1));
+    await Promise.resolve();
+    expect(request).toHaveBeenCalledOnce();
+    expect(transport.getStatus().queueEvents).toBe(0);
+    expect(transport.getStatus().droppedEvents).toBeGreaterThan(0);
+    transport.destroy();
+  });
+
+  it('rejects dependent mutations after a failed baseline upload', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 413 })));
+    const config = resolveReplayConfig({ maxBufferSize: 2000, maxRetryAttempts: 1 }, 'key', 'https://api.test');
+    const transport = new ReplayTransport(config, { compress: vi.fn(async (events: unknown[]) => {
+      const encoded = new TextEncoder().encode(JSON.stringify(events));
+      return { compressed: gzipSync(encoded), originalSize: encoded.length };
+    }) } as any);
+    const request = vi.fn();
+    transport.setSnapshotRequest(request);
+    transport.start(() => 'a'.repeat(32), () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent(snapshot(Date.now()));
+    await transport.flush();
+    transport.addEvent(mutation(Date.now() + 1));
+    await transport.flush();
+    await Promise.resolve();
+    expect(request).toHaveBeenCalledOnce();
+    expect(transport.getStatus().queueEvents).toBe(0);
+    expect(transport.getStatus().droppedChunks).toBe(1);
+    expect(vi.mocked(fetch)).toHaveBeenCalledOnce();
+    transport.destroy();
+  });
 });

@@ -81,7 +81,9 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
     generation++;
     closeRecorder();
     removeOwnedBridge();
-    lastStatus = transport?.getStatus() ?? lastStatus;
+    const prior = transport?.getStatus();
+    if (prior) lastStatus = { ...prior, queueBytes: 0, queueEvents: 0, queueChunks: 0,
+      deliveryState: 'idle', reason: prior.captureState === 'failed' ? prior.reason : 'privacy_stop' };
     statusUnsubscribe?.();
     statusUnsubscribe = null;
     transport?.destroy();
@@ -163,7 +165,6 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
           ownedSession.setQueueFailureCallback(() => {
             if (!current(token)) return;
             transport?.failSnapshotTooLarge();
-            discard();
           });
           ownedSession.setFlushCallback(() => { if (current(token)) void transport?.flush().catch(() => {}); });
           ownedSession.setRestartCallback(() => { if (current(token)) { closeRecorder(); beginRecorder(); } });
@@ -285,4 +286,4 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
   return integration;
 }
 
-export type { ReplayConfig, Integration, ReplayIntegration } from './types';
+export type { ReplayConfig, Integration, ReplayIntegration, ReplayStatus } from './types';

@@ -18,6 +18,18 @@ interface PendingCompression {
   resolve: (data: { compressed: Uint8Array; originalSize: number }) => void;
   reject: (err: Error) => void;
   events: any[];
+  timer: ReturnType<typeof setTimeout>;
+  maxInputBytes: number;
+}
+
+const DEFAULT_TIMEOUT_MS = 5_000;
+const DEFAULT_INPUT_LIMIT = 4 * 1024 * 1024;
+const MAX_TIMEOUT_MS = 15_000;
+const MAX_INPUT_LIMIT = 24 * 1024 * 1024;
+
+function bounded(value: number | undefined, fallback: number, ceiling: number): number {
+  return value !== undefined && Number.isFinite(value) && value > 0
+    ? Math.min(Math.floor(value), ceiling) : fallback;
 }
 
 export class CompressionWorker {
@@ -25,10 +37,13 @@ export class CompressionWorker {
   private pendingCallbacks = new Map<number, PendingCompression>();
   private useMainThread = false;
   private nextRequestId = 0;
+  private destroyed = false;
 
   constructor() {
     this.initWorker();
   }
+
+  getMode(): 'worker' | 'fallback' { return this.worker && !this.useMainThread ? 'worker' : 'fallback'; }
 
   /**
    * Create an inline Blob URL worker from WORKER_SCRIPT.
@@ -46,20 +61,20 @@ export class CompressionWorker {
         const pending = this.pendingCallbacks.get(segmentId);
         if (!pending) return;
         this.pendingCallbacks.delete(segmentId);
+        clearTimeout(pending.timer);
 
         if (error) {
           // Worker reported an error (e.g. CompressionStream not available)
           // Fall back to main-thread compression for this and future calls
-          console.warn(
-            '[TraceKit Replay] Worker compression failed, falling back to main thread:',
-            error,
-          );
+          console.warn('[TraceKit Replay] Worker compression failed. Using bounded fallback.');
           this.useMainThread = true;
-          this.compressMainThread(pending.events).then(pending.resolve).catch(pending.reject);
+          this.compressMainThread(pending.events, Math.min(pending.maxInputBytes, DEFAULT_INPUT_LIMIT)).then(pending.resolve).catch(pending.reject);
           return;
         }
-
-        pending.resolve({ compressed, originalSize });
+        if (!(compressed instanceof Uint8Array) || compressed.byteLength > pending.maxInputBytes ||
+            !Number.isSafeInteger(originalSize) || originalSize > pending.maxInputBytes) {
+          pending.reject(new Error('Replay worker output exceeds its bound'));
+        } else pending.resolve({ compressed, originalSize });
       };
 
       this.worker.onerror = () => {
@@ -70,7 +85,8 @@ export class CompressionWorker {
         this.worker?.terminate();
         this.worker = null;
         for (const pending of this.pendingCallbacks.values()) {
-          this.compressMainThread(pending.events).then(pending.resolve).catch(pending.reject);
+          clearTimeout(pending.timer);
+          this.compressMainThread(pending.events, Math.min(pending.maxInputBytes, DEFAULT_INPUT_LIMIT)).then(pending.resolve).catch(pending.reject);
         }
         this.pendingCallbacks.clear();
       };
@@ -96,21 +112,41 @@ export class CompressionWorker {
   async compress(
     events: any[],
     _segmentId: number,
+    options: { timeoutMs?: number; maxInputBytes?: number } = {},
   ): Promise<{ compressed: Uint8Array; originalSize: number }> {
+    if (this.destroyed) throw new Error('Replay compression worker destroyed');
+    const maxInputBytes = bounded(options.maxInputBytes, DEFAULT_INPUT_LIMIT, MAX_INPUT_LIMIT);
+    const timeoutMs = bounded(options.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+    const encodedSize = new TextEncoder().encode(JSON.stringify(events)).byteLength;
+    if (encodedSize > maxInputBytes) throw new Error('Replay compression input exceeds its bound');
     if (this.useMainThread || !this.worker) {
-      return this.compressMainThread(events);
+      return this.compressMainThread(events, Math.min(maxInputBytes, DEFAULT_INPUT_LIMIT));
     }
 
+    // Transport uses one job. Keep two direct worker callers compatible.
+    if (this.pendingCallbacks.size >= 2) throw new Error('Replay compression queue full');
+
     return new Promise((resolve, reject) => {
-      const entry: PendingCompression = { resolve, reject, events };
       // Session segment numbers restart at zero; worker requests never reuse them.
       const requestId = this.nextRequestId++;
+      const timer = setTimeout(() => {
+        const pending = this.pendingCallbacks.get(requestId);
+        if (!pending) return;
+        this.pendingCallbacks.delete(requestId);
+        pending.reject(new Error('Replay compression timeout'));
+        this.worker?.terminate();
+        this.worker = null;
+        this.useMainThread = true;
+      }, timeoutMs);
+      const entry: PendingCompression = { resolve, reject, events, timer, maxInputBytes };
       this.pendingCallbacks.set(requestId, entry);
       try {
         this.worker!.postMessage({ events, segmentId: requestId });
       } catch {
         this.pendingCallbacks.delete(requestId);
-        this.compressMainThread(events).then(resolve).catch(reject);
+        clearTimeout(timer);
+        this.useMainThread = true;
+        this.compressMainThread(events, Math.min(maxInputBytes, DEFAULT_INPUT_LIMIT)).then(resolve).catch(reject);
       }
     });
   }
@@ -121,10 +157,13 @@ export class CompressionWorker {
    */
   private async compressMainThread(
     events: any[],
+    maxInputBytes: number,
   ): Promise<{ compressed: Uint8Array; originalSize: number }> {
     const json = JSON.stringify(events);
     const encoded = new TextEncoder().encode(json);
+    if (encoded.byteLength > maxInputBytes) throw new Error('Replay fallback input exceeds its bound');
     const compressed = gzipSync(encoded, { level: 6 });
+    if (compressed.byteLength > maxInputBytes) throw new Error('Replay fallback output exceeds its bound');
     return { compressed, originalSize: encoded.length };
   }
 
@@ -132,11 +171,13 @@ export class CompressionWorker {
    * Terminate the worker and clean up pending callbacks.
    */
   destroy(): void {
+    this.destroyed = true;
     if (this.worker) {
       this.worker.terminate();
       this.worker = null;
     }
     for (const pending of this.pendingCallbacks.values()) {
+      clearTimeout(pending.timer);
       pending.reject(new Error('Replay compression worker destroyed'));
     }
     this.pendingCallbacks.clear();
