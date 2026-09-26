@@ -48,7 +48,7 @@ export class ReplayTransport {
   private retryWaiters = new Map<ReturnType<typeof setTimeout>, (active: boolean) => void>();
   private cancelled = false;
   private awaitingSnapshot = false;
-  private allowBufferedHistory = false;
+  private retainedBufferHistory = false;
   private activeCompressions = 0;
   private listeners = new Set<ReplayStatusListener>();
   private publishQueued = false;
@@ -287,7 +287,7 @@ export class ReplayTransport {
   }
 
   private enqueuePendingEvent(event: any, prepend = false, evictAge = true): void {
-    if (this.awaitingSnapshot && event?.type !== 2 && !this.allowBufferedHistory) {
+    if (this.awaitingSnapshot && event?.type !== 2 && !this.retainedBufferHistory) {
       this.status.droppedEvents++;
       return;
     }
@@ -300,13 +300,13 @@ export class ReplayTransport {
         this.pendingEvents = [];
         this.bufferSize = 0;
         this.awaitingSnapshot = true;
-        this.allowBufferedHistory = this.replayTypeFn?.() === 'buffer';
+        this.retainedBufferHistory = this.replayTypeFn?.() === 'buffer';
       }
       return;
     }
     if (event?.type === 2) {
       this.awaitingSnapshot = false;
-      this.allowBufferedHistory = false;
+      this.retainedBufferHistory = false;
     }
     if (prepend) this.pendingEvents.unshift(event);
     else this.pendingEvents.push(event);
@@ -328,9 +328,14 @@ export class ReplayTransport {
   private enforcePendingBounds(): void {
     while (this.pendingEvents.length > this.config.maxBufferEvents || this.bufferSize > this.config.maxBufferSize) {
       if (this.pendingEvents.length <= 1) {
+        const dropped = this.pendingEvents[0];
         this.pendingEvents = [];
         this.bufferSize = 0;
         this.status.droppedEvents++;
+        if (dropped?.type === 2) {
+          this.awaitingSnapshot = true;
+          this.retainedBufferHistory = false;
+        }
         this.publish('snapshot_too_large');
         return;
       }
@@ -339,11 +344,11 @@ export class ReplayTransport {
       this.status.droppedEvents++;
       if (dropped?.type === 2) {
         this.awaitingSnapshot = true;
-        this.allowBufferedHistory = this.replayTypeFn?.() === 'buffer';
+        this.retainedBufferHistory = this.replayTypeFn?.() === 'buffer';
       }
       this.publish('queue_limit');
     }
-    if (this.awaitingSnapshot && !this.allowBufferedHistory && this.pendingEvents.length > 0) {
+    if (this.awaitingSnapshot && !this.retainedBufferHistory && this.pendingEvents.length > 0) {
       this.status.droppedEvents += this.pendingEvents.length;
       this.pendingEvents = [];
       this.bufferSize = 0;
@@ -353,6 +358,17 @@ export class ReplayTransport {
 
   private removePendingOrphans(): void {
     const snapshot = this.pendingEvents.findIndex((event) => event?.type === 2);
+    if (snapshot < 0 && this.pendingEvents.length > 0) {
+      this.awaitingSnapshot = true;
+      this.retainedBufferHistory = this.replayTypeFn?.() === 'buffer';
+      if (!this.retainedBufferHistory) {
+        this.status.droppedEvents += this.pendingEvents.length;
+        this.pendingEvents = [];
+        this.bufferSize = 0;
+        this.publish('snapshot_required');
+      }
+      return;
+    }
     if (snapshot > 0) {
       const removed = this.pendingEvents.splice(0, snapshot);
       this.bufferSize -= removed.reduce((total, event) => total + utf8Size(event), 0);
@@ -388,8 +404,8 @@ export class ReplayTransport {
     const events = this.pendingEvents;
     this.pendingEvents = [];
     this.bufferSize = 0;
-    const flushedBufferedHistory = this.allowBufferedHistory;
-    if (flushedBufferedHistory) this.allowBufferedHistory = false;
+    const flushedBufferedHistory = this.retainedBufferHistory;
+    if (flushedBufferedHistory) this.retainedBufferHistory = false;
     const pendingIdentity = this.pendingIdentity;
     this.pendingIdentity = null;
 
@@ -398,6 +414,14 @@ export class ReplayTransport {
     this.activeChunkBytes += chunkBytes;
     this.publish('chunk_queued');
     if (flushedBufferedHistory) this.awaitingSnapshot = true;
+    if (this.awaitingSnapshot && this.replayTypeFn?.() === 'buffer') {
+      this.status.droppedEvents += events.length;
+      this.outcome('dropped', 'snapshot_required');
+      this.activeChunkBytes -= chunkBytes;
+      this.activeCompressions--;
+      this.publish('chunk_finished');
+      return;
+    }
     try {
       if (!this.isCurrent(generation)) {
         this.outcome('unknown', 'cancelled');
@@ -481,6 +505,8 @@ export class ReplayTransport {
       const events = this.pendingEvents;
       this.pendingEvents = [];
       this.bufferSize = 0;
+      const flushedBufferedHistory = this.retainedBufferHistory;
+      if (flushedBufferedHistory) this.retainedBufferHistory = false;
       const pendingIdentity = this.pendingIdentity;
       this.pendingIdentity = null;
 
@@ -491,6 +517,13 @@ export class ReplayTransport {
         userId: this.userIdFn?.() ?? '',
       };
       const { sessionId, segmentId, mode: replayType } = allocation;
+
+      if (this.awaitingSnapshot && replayType === 'buffer') {
+        this.status.droppedEvents += events.length;
+        this.outcome('dropped', 'snapshot_required');
+        return;
+      }
+      if (flushedBufferedHistory) this.awaitingSnapshot = true;
 
       if (!sessionId) {
         this.outcome('dropped', 'missing_session');

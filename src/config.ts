@@ -7,7 +7,6 @@
  */
 
 import type { ReplayConfig, ResolvedReplayConfig } from './types';
-import { configureRingBufferDefaults } from './buffer';
 
 const DEFAULTS = {
   sessionSampleRate: 0.1,
@@ -129,7 +128,7 @@ export function resolveReplayConfig(
     errorSampleRate = 1.0 - sessionSampleRate;
   }
 
-  const resolved = {
+  return {
     sessionSampleRate,
     errorSampleRate,
     unmask: resolveUnmask(config.unmask),
@@ -149,6 +148,4 @@ export function resolveReplayConfig(
     apiKey,
     endpoint,
   };
-  configureRingBufferDefaults(resolved);
-  return resolved;
 }

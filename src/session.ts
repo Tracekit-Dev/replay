@@ -170,7 +170,11 @@ export class SessionManager {
 
   constructor(config: ResolvedReplayConfig) {
     this.config = config;
-    this.ringBuffer = new RingBuffer(60_000);
+    this.ringBuffer = new RingBuffer({
+      maxAgeMs: config.maxBufferAgeMs ?? 60_000,
+      maxBytes: config.maxBufferSize ?? 24_117_248,
+      maxEvents: config.maxBufferEvents ?? 10_000,
+    });
 
     this.identityUserId = config.identityUserId ?? '';
     const existing = getOrCreateSession(config, this.ownerToken);
@@ -249,6 +253,7 @@ export class SessionManager {
           try { this.restartCallback(); } catch { /* Never crash the host app */ }
         }
         events = this.ringBuffer.flush();
+        if (!events.some((event) => event?.type === 2)) return;
       }
       if (events.length > 0 && this.eventCallback) {
         try {
