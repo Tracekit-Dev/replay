@@ -69,6 +69,8 @@ export class SessionManager {
   private resumeCallback: (() => void) | null = null;
   private idleStopCallback: (() => void) | null = null;
   private queueFailureCallback: (() => void) | null = null;
+  private bufferDropCallback: ((events: number, bytes: number) => void) | null = null;
+  private baselineRequestState: 'none' | 'scheduled' | 'delivered' = 'none';
   private activityHandlers: Array<[string, (event: Event) => void]> = [];
   private active = true;
   private destroyed = false;
@@ -131,7 +133,15 @@ export class SessionManager {
         }
       }
     } else if (this.state.mode === 'buffer') {
-      if (this.ringBuffer.add(event) === 'snapshot_too_large') this.queueFailureCallback?.();
+      const result = this.ringBuffer.add(event);
+      this.reportBufferLoss();
+      if (result?.reason === 'snapshot_too_large') {
+        this.queueFailureCallback?.();
+      } else if (this.ringBuffer.hasBaseline && event?.type === 2) {
+        this.baselineRequestState = 'none';
+      } else if (result?.reason === 'baseline_lost' && !this.ringBuffer.hasBaseline) {
+        this.requestFreshBaseline();
+      }
     }
     // mode === 'off': discard
   }
@@ -152,10 +162,12 @@ export class SessionManager {
     }
     if (this.active && this.isVisible() && this.state.mode === 'buffer') {
       let events = this.ringBuffer.flush();
+      this.reportBufferLoss();
       // A delayed error can leave no usable baseline after stale eviction.
       // Start a fresh snapshot while still in buffer mode, then flush it.
       if (!events.some((event) => event?.type === 2)) {
         this.ringBuffer.clear();
+        if (this.baselineRequestState === 'scheduled') this.baselineRequestState = 'delivered';
         if (this.restartCallback) {
           try { this.restartCallback(); } catch { /* Never crash the host app */ }
         }
@@ -185,6 +197,23 @@ export class SessionManager {
 
   /** Report a baseline that cannot fit the bounded error history. */
   setQueueFailureCallback(cb: () => void): void { this.queueFailureCallback = cb; }
+
+  setBufferDropCallback(cb: (events: number, bytes: number) => void): void { this.bufferDropCallback = cb; }
+
+  private reportBufferLoss(): void {
+    const loss = this.ringBuffer.takeLossReport();
+    if (loss.droppedEvents > 0) this.bufferDropCallback?.(loss.droppedEvents, loss.droppedBytes);
+  }
+
+  private requestFreshBaseline(): void {
+    if (this.baselineRequestState !== 'none') return;
+    this.baselineRequestState = 'scheduled';
+    queueMicrotask(() => {
+      if (this.destroyed || this.baselineRequestState !== 'scheduled' || this.state.mode !== 'buffer') return;
+      this.baselineRequestState = 'delivered';
+      try { this.restartCallback?.(); } catch { /* Keep capture isolated. */ }
+    });
+  }
 
   getRetainedBytes(): number { return this.ringBuffer.byteSize; }
   getRetainedEventCount(): number { return this.ringBuffer.size; }
@@ -258,6 +287,7 @@ export class SessionManager {
     this.state = { sessionId: newSessionId(), mode: decideSamplingMode(this.config), startedAt: now, lastActivity: now, segmentId: 0 };
     this.active = Boolean(this.state.sessionId) && this.isVisible();
     this.ringBuffer.clear();
+    this.baselineRequestState = 'none';
   }
 
   /** Get full session state */
@@ -271,7 +301,9 @@ export class SessionManager {
    */
   flush(): any[] {
     if (this.state.mode === 'buffer') {
-      return this.ringBuffer.flush();
+      const events = this.ringBuffer.flush();
+      this.reportBufferLoss();
+      return events;
     }
     return [];
   }
@@ -422,6 +454,7 @@ export class SessionManager {
     this.activityHandlers = [];
 
     this.ringBuffer.clear();
+    this.baselineRequestState = 'none';
 
     this.eventCallback = null;
     this.flushCallback = null;
@@ -429,5 +462,7 @@ export class SessionManager {
     this.pauseCallback = null;
     this.resumeCallback = null;
     this.idleStopCallback = null;
+    this.bufferDropCallback = null;
+    this.queueFailureCallback = null;
   }
 }

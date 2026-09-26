@@ -28,6 +28,13 @@ vi.mock('../src/recorder', () => ({ startRecording: vi.fn((_config, emit) => {
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe('bounded error history', () => {
+  it('does not report intentional pre-baseline metadata as lost recording data', () => {
+    const ring = new RingBuffer(60_000, { maxBytes: 4096 });
+    expect(ring.add({ type: 4, timestamp: Date.now(), data: { href: 'https://example.test' } })).toBeNull();
+    ring.add(snapshot(Date.now()));
+    expect(ring.takeLossReport().droppedEvents).toBe(0);
+    expect(ring.flush()[0].type).toBe(2);
+  });
   it.each(['events', 'bytes', 'age'])('reports %s baseline loss and clears dependent events', async (limit) => {
     vi.useFakeTimers();
     const first = snapshot(Date.now());
@@ -270,6 +277,36 @@ describe('bounded delivery', () => {
     transport.destroy();
   });
 
+  it('does not charge a late old-session failure to the new session', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let compressionCall = 0;
+    const worker = { compress: vi.fn(async (events: unknown[]) => {
+      compressionCall++;
+      if (compressionCall === 1) { await gate; throw new Error('synthetic worker failure'); }
+      const bytes = new TextEncoder().encode(JSON.stringify(events));
+      return { compressed: gzipSync(bytes), originalSize: bytes.length };
+    }) };
+    const fetchMock = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal('fetch', fetchMock);
+    let identity = 'a'.repeat(32);
+    const transport = new ReplayTransport(resolveReplayConfig({ sessionSampleRate: 1 }, 'key', 'https://api.test'), worker as any);
+    transport.start(() => identity, () => 0, () => 'session', () => '', () => '');
+    transport.stop();
+    transport.addEvent(snapshot(Date.now()));
+    const oldFlush = transport.flush();
+    identity = 'b'.repeat(32);
+    transport.setSessionIdentity(identity);
+    release();
+    await oldFlush;
+    transport.addEvent(snapshot(Date.now() + 1));
+    await transport.flush();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect((fetchMock.mock.calls[0][1] as any).headers['X-Replay-Dropped-Events']).toBe('0');
+    expect(transport.getStatus().droppedChunks).toBe(1);
+    transport.destroy();
+  });
+
   it.each([true, false])('sends version and drops on %s beacon acceptance', async (accepted) => {
     const beacon = vi.fn(() => accepted);
     const fetchMock = vi.fn(async () => ({ ok: true }));
@@ -277,9 +314,9 @@ describe('bounded delivery', () => {
     vi.stubGlobal('fetch', fetchMock);
     const transport = new ReplayTransport(resolveReplayConfig({ sessionSampleRate: 1 }, 'key', 'https://api.test'),
       { compress: vi.fn() } as any);
-    transport.recordDroppedEvents(7, 70);
     transport.start(() => 'a'.repeat(32), () => 0, () => 'session', () => '', () => '');
     transport.stop();
+    transport.recordDroppedEvents(7, 70);
     transport.addEvent(snapshot(Date.now()));
     transport.flushSync();
     const [url, blob] = accepted ? beacon.mock.calls[0] : fetchMock.mock.calls[0];

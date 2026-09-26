@@ -130,6 +130,7 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
           const beginRecorder = () => {
             if (!current(token) || !ownedSession.isActive() || !ownedSession.isVisible() || ownedSession.getMode() === 'off' || stopRecorder) return;
             if (currentUserId() !== recordingUserId) { boundary(); return; }
+            transport?.setSessionIdentity(ownedSession.getFlushSessionId());
             transport?.startRecordingWindow();
             stopRecorder = startRecording(replayConfig, (event, checkout) => {
               if (!current(token) || rotatingUser || session !== ownedSession) return;
@@ -151,7 +152,7 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
             rotatingUser = true;
             try {
               closeRecorder();
-              void transport?.flush().catch(() => {});
+              void transport?.flush(true).catch(() => {});
               ownedSession.rotateIdentity();
               recordingUserId = currentUserId();
             } finally { rotatingUser = false; }
@@ -166,7 +167,10 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
             if (!current(token)) return;
             transport?.failSnapshotTooLarge();
           });
-          ownedSession.setFlushCallback(() => { if (current(token)) void transport?.flush().catch(() => {}); });
+          ownedSession.setBufferDropCallback((events, bytes) => {
+            if (current(token)) transport?.recordDroppedEvents(events, bytes);
+          });
+          ownedSession.setFlushCallback(() => { if (current(token)) void transport?.flush(true).catch(() => {}); });
           ownedSession.setRestartCallback(() => { if (current(token)) { closeRecorder(); beginRecorder(); } });
           ownedSession.setIdleStopCallback(() => { if (current(token)) closeRecorder(); });
           ownedSession.setPauseCallback(() => {

@@ -22,6 +22,7 @@ import { ReplayPrivacySanitizer, sanitizeReplayUrl } from './privacy';
 // sendBeacon has a ~64KB payload limit
 const BEACON_SIZE_LIMIT = 65536;
 const FALLBACK_INPUT_LIMIT = 4 * 1024 * 1024;
+const REPORTED_DROP_LIMIT = 1_000_000;
 const textEncoder = new TextEncoder();
 
 function serializedSize(value: unknown): number {
@@ -53,6 +54,9 @@ export class ReplayTransport {
   private activeEvents = 0;
   private activeFlush: Promise<void> | null = null;
   private activeStartedAt = 0;
+  private activeSessionId = '';
+  private reportingSessionId = '';
+  private dropBaselineTotal = 0;
   private needsSnapshot = false;
   private snapshotRequested = false;
   private requestSnapshot: (() => void) | null = null;
@@ -109,6 +113,29 @@ export class ReplayTransport {
     };
   }
 
+  /** Include bounded error-history loss in later immutable chunk evidence. */
+  recordDroppedEvents(events: number, bytes: number): void {
+    if (this.destroyed) return;
+    if (!Number.isFinite(events) || !Number.isFinite(bytes) || events <= 0 || bytes < 0) return;
+    try { this.setSessionIdentity(this.sessionIdFn?.() ?? ''); } catch { /* Keep diagnostics isolated. */ }
+    this.status.droppedEvents = Math.min(Number.MAX_SAFE_INTEGER, this.status.droppedEvents + Math.floor(events));
+    this.status.droppedBytes = Math.min(Number.MAX_SAFE_INTEGER, this.status.droppedBytes + Math.floor(bytes));
+    this.status.reason = 'queue_limit';
+    this.publishStatus();
+  }
+
+  /** Reset only upload evidence when a new recording identity begins. */
+  setSessionIdentity(sessionId: string): void {
+    if (!sessionId || sessionId === this.reportingSessionId) return;
+    this.reportingSessionId = sessionId;
+    this.dropBaselineTotal = this.status.droppedEvents;
+  }
+
+  private reportedDrops(): string {
+    return String(Math.min(REPORTED_DROP_LIMIT,
+      Math.max(0, Math.floor(this.status.droppedEvents - this.dropBaselineTotal))));
+  }
+
   subscribeStatus(listener: (status: ReplayStatus) => void): () => void {
     this.statusListeners.add(listener);
     return () => { this.statusListeners.delete(listener); };
@@ -150,6 +177,7 @@ export class ReplayTransport {
     this.urlFn = getUrl;
     this.userIdFn = getUserId;
     this.recordingDeadlineFn = getRecordingDeadline ?? null;
+    try { this.setSessionIdentity(getSessionId()); } catch { /* Identity is checked during flush. */ }
 
     // Start periodic flush at config.flushInterval (default 30s)
     this.flushTimer = setInterval(() => {
@@ -272,6 +300,7 @@ export class ReplayTransport {
   addEvent(event: any): void {
     if (this.destroyed || this.status.captureState === 'failed') return;
     try {
+      this.setSessionIdentity(this.sessionIdFn?.() ?? '');
       this.expirePending();
       const safe = this.sanitizer.sanitize(event);
       if (!safe) return;
@@ -365,7 +394,7 @@ export class ReplayTransport {
    * Flush pending events: compress via worker and upload via fetch with retry.
    * Returns silently if no events are pending.
    */
-  async flush(): Promise<void> {
+  async flush(final = false): Promise<void> {
     if (this.destroyed) return;
     if (this.activeFlush) return this.activeFlush;
     const generation = this.generation;
@@ -384,9 +413,14 @@ export class ReplayTransport {
     this.activeStartedAt = Date.now();
     this.status.deliveryState = 'pending';
     this.publishStatus();
-    const job = (async () => {
+    let finish!: () => void;
+    const job = new Promise<void>((resolve) => { finish = resolve; });
+    this.activeFlush = job;
+    void (async () => {
     try {
       const sessionId = this.sessionIdFn ? this.sessionIdFn() : '';
+      this.setSessionIdentity(sessionId);
+      this.activeSessionId = sessionId;
       const segmentId = this.segmentIdFn ? this.segmentIdFn() : 0;
 
       if (!sessionId) {
@@ -400,7 +434,7 @@ export class ReplayTransport {
         return;
       }
 
-      const headers = this.uploadHeaders(segmentId);
+      const headers = this.uploadHeaders(segmentId, final, this.reportedDrops());
       this.status.compressionMode = this.compressionWorker.getMode?.() ?? 'unknown';
       const { compressed, originalSize } = await this.compressionWorker.compress(
         events, segmentId, { timeoutMs: this.config.compressionTimeoutMs, maxInputBytes: this.config.maxBufferSize },
@@ -425,18 +459,21 @@ export class ReplayTransport {
         this.activeCompressedBytes = 0;
         this.activeEvents = 0;
         this.activeStartedAt = 0;
-        this.activeFlush = null;
+        this.activeSessionId = '';
+        if (this.activeFlush === job) this.activeFlush = null;
         if (this.status.deliveryState !== 'degraded') this.status.deliveryState = this.pendingEvents.length ? 'pending' : 'idle';
         this.publishStatus();
       }
     }
-    })();
-    this.activeFlush = job;
+    })().then(finish, finish);
     return job;
   }
 
   private dropActive(reason: ReplayStatus['reason']): void {
     this.status.droppedEvents += this.activeEvents;
+    if (this.activeSessionId && this.activeSessionId !== this.reportingSessionId) {
+      this.dropBaselineTotal += this.activeEvents;
+    }
     this.status.droppedBytes += this.activeRawBytes;
     this.status.droppedChunks++;
     this.status.deliveryState = 'degraded';
@@ -458,7 +495,7 @@ export class ReplayTransport {
    * Falls back to fetch with keepalive:true if sendBeacon fails.
    * If both fail, data is lost (acceptable for replay).
    */
-  flushSync(): void {
+  flushSync(final = false): void {
     if (this.destroyed) return;
     this.appendRecordingBoundaries();
     this.expirePending();
@@ -483,8 +520,10 @@ export class ReplayTransport {
       if (events.length === 0) return;
 
       const sessionId = this.sessionIdFn ? this.sessionIdFn() : '';
+      this.setSessionIdentity(sessionId);
       const segmentId = this.segmentIdFn ? this.segmentIdFn() : 0;
       const replayType = this.replayTypeFn ? this.replayTypeFn() : 'session';
+      const droppedEvents = this.reportedDrops();
 
       if (!sessionId) {
         this.recordSyncDrop(events.length, rawBytes, 'missing_identity');
@@ -527,6 +566,9 @@ export class ReplayTransport {
         `&replay_user_id=${encodeURIComponent(replayUserId)}` +
         `&click_count=${this.clickCount}` +
         `&keypress_count=${this.keypressCount}` +
+        `&protocol_version=1` +
+        `&dropped_events=${droppedEvents}` +
+        (final ? `&final_segment_id=${segmentId}` : '') +
         (serviceName ? `&service_name=${encodeURIComponent(serviceName)}` : '');
 
       // Cast through ArrayBuffer to satisfy TypeScript 5.x Uint8Array<ArrayBufferLike> vs BlobPart
@@ -695,7 +737,7 @@ export class ReplayTransport {
   }
 
   /** Capture metadata before compression or retries can cross a session boundary. */
-  private uploadHeaders(segmentId: number): Record<string, string> {
+  private uploadHeaders(segmentId: number, final: boolean, droppedEvents: string): Record<string, string> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/octet-stream',
       'X-API-Key': this.config.apiKey,
@@ -705,7 +747,10 @@ export class ReplayTransport {
       'X-Replay-User-Id': '',
       'X-Click-Count': String(this.clickCount),
       'X-Keypress-Count': String(this.keypressCount),
+      'X-Replay-Protocol-Version': '1',
+      'X-Replay-Dropped-Events': droppedEvents,
     };
+    if (final) headers['X-Replay-Final-Segment-Id'] = String(segmentId);
     const serviceName = boundedServiceName(this.config.serviceName);
     if (serviceName) headers['X-Replay-Service-Name'] = serviceName;
     return headers;
