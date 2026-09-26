@@ -20,50 +20,8 @@ import { RingBuffer } from './buffer';
 // Helpers
 // ---------------------------------------------------------------------------
 
-const STORAGE_PREFIX = '__tracekit_replay_session_v2_';
 // PostgreSQL replay_chunks.segment_id is a signed INTEGER.
 const MAX_SEGMENT_ID = 0x7fff_fffe;
-const ID_PATTERN = /^[0-9a-f]{32}$/;
-
-function verifiedReload(): boolean {
-  if (typeof performance === 'undefined' || typeof location === 'undefined') return false;
-  try {
-    const entries = performance.getEntriesByType('navigation');
-    if (entries.length !== 1) return false;
-    const entry = entries[0] as PerformanceNavigationTiming;
-    return entry.type === 'reload' && new URL(entry.name).href === new URL(location.href).href;
-  } catch { return false; }
-}
-
-function sharedCounter(raw: string | null): { next: number; expiresAt: number } | null {
-  if (!raw) return null;
-  try {
-    const value: unknown = JSON.parse(raw);
-    if (!value || typeof value !== 'object') return null;
-    const item = value as { next?: unknown; expiresAt?: unknown };
-    if (!Number.isSafeInteger(item.next) || (item.next as number) < 0 || (item.next as number) > MAX_SEGMENT_ID + 1) return null;
-    if (!Number.isFinite(item.expiresAt) || (item.expiresAt as number) <= 0) return null;
-    return { next: item.next as number, expiresAt: item.expiresAt as number };
-  } catch { return null; }
-}
-
-function counterValue(next: number, idleTimeout: number): string {
-  return JSON.stringify({ next, expiresAt: Date.now() + idleTimeout });
-}
-
-function cleanExpiredCounters(namespace: string): void {
-  try {
-    const keys: string[] = [];
-    for (let index = 0; index < localStorage.length; index++) {
-      const key = localStorage.key(index);
-      if (key?.startsWith(`${namespace}_`) && ID_PATTERN.test(key.slice(namespace.length + 1))) keys.push(key);
-    }
-    for (const key of keys) {
-      const current = sharedCounter(localStorage.getItem(key));
-      if (!current || current.expiresAt <= Date.now()) localStorage.removeItem(key);
-    }
-  } catch { /* Storage can be blocked; never depend on cleanup for identity safety. */ }
-}
 
 /**
  * Generate a 32-character hex session ID.
@@ -78,26 +36,6 @@ function newSessionId(): string {
     return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
   }
   return '';
-}
-
-function validStored(value: unknown, config: ResolvedReplayConfig): value is SessionState {
-  if (!value || typeof value !== 'object') return false;
-  const item = value as SessionState;
-  const age = Date.now() - item.lastActivity;
-  return typeof item.sessionId === 'string' && ID_PATTERN.test(item.sessionId) && Number.isSafeInteger(item.segmentId) &&
-    item.segmentId >= 0 && item.segmentId <= MAX_SEGMENT_ID &&
-    (item.mode === 'session' || item.mode === 'buffer' || item.mode === 'off') &&
-    Number.isFinite(item.lastActivity) && Number.isFinite(age) && age >= 0 && age < config.idleTimeout;
-}
-
-async function storageNamespace(config: ResolvedReplayConfig): Promise<string | null> {
-  if (!config.apiKey || !config.serviceName || typeof crypto === 'undefined' || !crypto.subtle) return null;
-  try {
-    const endpoint = new URL(config.endpoint).href;
-    const input = new TextEncoder().encode(JSON.stringify([endpoint, config.serviceName, config.apiKey]));
-    const digest = await crypto.subtle.digest('SHA-256', input);
-    return STORAGE_PREFIX + Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
-  } catch { return null; }
 }
 
 /**
@@ -133,11 +71,6 @@ export class SessionManager {
   private activityHandlers: Array<[string, (event: Event) => void]> = [];
   private active = true;
   private destroyed = false;
-  private readyPromise: Promise<void>;
-  private identityReady = false;
-  private keepFreshForPageview = false;
-  private storageKey: string | null = null;
-  private releaseClaim: (() => void) | null = null;
 
   // Idle timeout handle
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -159,104 +92,17 @@ export class SessionManager {
       segmentId: 0,
     };
 
-    this.active = false;
-    this.readyPromise = this.initializeIdentity();
-  }
-
-  /** Recording and segment allocation must wait for this ownership decision. */
-  ready(): Promise<void> { return this.readyPromise; }
-
-  /** Give an initial pageview a fresh ID without allowing an unsafe later restore. */
-  getPageviewSessionId(): string {
-    if (this.identityReady) return this.getSessionId();
-    if (!this.state.sessionId || this.state.mode === 'off' || !this.isVisible()) return '';
-    this.keepFreshForPageview = true;
-    return this.state.sessionId;
-  }
-
-  private async initializeIdentity(): Promise<void> {
-    const key = await storageNamespace(this.config);
-    if (this.destroyed) return;
-    if (key && typeof localStorage !== 'undefined') cleanExpiredCounters(key);
-    if (!this.keepFreshForPageview && key && typeof sessionStorage !== 'undefined' && typeof navigator !== 'undefined' && navigator.locks) {
-      try {
-        const raw = sessionStorage.getItem(key);
-        const stored: unknown = raw ? JSON.parse(raw) : null;
-        if (verifiedReload() && validStored(stored, this.config) && await this.claim(key, stored.sessionId)) {
-          const current = sharedCounter(localStorage.getItem(`${key}_${stored.sessionId}`));
-          if (current?.next === stored.segmentId && current.expiresAt > Date.now()) {
-            this.state = { ...stored, startedAt: Date.now(), lastActivity: Date.now() };
-            this.storageKey = key;
-          } else {
-            this.releaseClaim?.();
-            this.releaseClaim = null;
-          }
-        }
-      } catch {
-        this.releaseClaim?.();
-        this.releaseClaim = null;
-      }
-      if (!this.storageKey && this.state.sessionId && await this.claim(key, this.state.sessionId)) {
-        try {
-          const counterKey = `${key}_${this.state.sessionId}`;
-          if (localStorage.getItem(counterKey) === null) {
-            const initial = counterValue(0, this.config.idleTimeout);
-            localStorage.setItem(counterKey, initial);
-            if (localStorage.getItem(counterKey) === initial) this.storageKey = key;
-          }
-        } catch { /* No shared counter means no reload continuity. */ }
-        if (!this.storageKey) {
-          this.releaseClaim?.();
-          this.releaseClaim = null;
-        }
-      }
-    }
-    if (this.destroyed) return;
-    this.identityReady = true;
     this.active = Boolean(this.state.sessionId) && this.isVisible();
-    this.persistSession();
     if (this.active) this.resetIdleTimer();
     this.setupVisibilityListener();
     this.setupActivityListeners();
   }
 
-  private async claim(key: string, id: string): Promise<boolean> {
-    const locks = typeof navigator !== 'undefined' ? navigator.locks : undefined;
-    if (!locks) return false;
-    let resolveClaim!: (value: boolean) => void;
-    let release!: () => void;
-    let settled = false;
-    let expired = false;
-    const claimed = new Promise<boolean>((resolve) => { resolveClaim = resolve; });
-    const held = new Promise<void>((resolve) => { release = resolve; });
-    const lockName = `${key}_${id}`;
-    const timeout = setTimeout(() => { expired = true; release(); resolveClaim(false); }, 1_000);
-    try {
-      void locks.request(lockName, { ifAvailable: true }, async (lock) => {
-        if (!lock || this.destroyed || expired) { settled = true; resolveClaim(false); return; }
-        settled = true;
-        this.releaseClaim = release;
-        resolveClaim(true);
-        await held;
-      }).catch(() => { if (!settled) resolveClaim(false); });
-      return await claimed;
-    } catch { return false; }
-    finally { clearTimeout(timeout); }
-  }
+  /** Identity is ready synchronously. Keep this method for Integration callers. */
+  ready(): Promise<void> { return Promise.resolve(); }
 
-  private persistSession(): void {
-    if (!this.storageKey || !this.releaseClaim || this.destroyed) return;
-    try {
-      const counterKey = `${this.storageKey}_${this.state.sessionId}`;
-      const current = sharedCounter(localStorage.getItem(counterKey));
-      if (current?.next !== this.state.segmentId || current.expiresAt <= Date.now()) return;
-      localStorage.setItem(counterKey, counterValue(this.state.segmentId, this.config.idleTimeout));
-      sessionStorage.setItem(this.storageKey, JSON.stringify({
-        sessionId: this.state.sessionId, segmentId: this.state.segmentId,
-        mode: this.state.mode, lastActivity: this.state.lastActivity,
-      }));
-    } catch { /* Future reloads will use fresh document IDs. */ }
-  }
+  /** The first automatic pageview uses the document's recording identity. */
+  getPageviewSessionId(): string { return this.getSessionId(); }
 
   // -------------------------------------------------------------------------
   // Event handling
@@ -322,7 +168,6 @@ export class SessionManager {
       }
       // Switch to full recording mode
       this.state.mode = 'session';
-      this.persistSession();
     }
     // session mode or off mode: no-op
   }
@@ -386,44 +231,22 @@ export class SessionManager {
 
   /** Return and increment segment counter */
   nextSegmentId(): number {
-    if (!this.identityReady || this.destroyed) throw new Error('Replay identity is not ready');
-    if (!this.state.sessionId || this.state.segmentId > MAX_SEGMENT_ID) {
+    if (this.destroyed) throw new Error('Replay identity is not ready');
+    if (!this.state.sessionId || !Number.isSafeInteger(this.state.segmentId) || this.state.segmentId < 0 || this.state.segmentId > MAX_SEGMENT_ID) {
       this.rotateIdentity();
       queueMicrotask(() => { if (!this.destroyed) this.restartCallback?.(); });
       throw new Error('Replay segment counter is unsafe');
     }
     const next = this.state.segmentId;
-    if (this.storageKey) {
-      try {
-        const counterKey = `${this.storageKey}_${this.state.sessionId}`;
-        const current = sharedCounter(localStorage.getItem(counterKey));
-        if (current?.next !== next || current.expiresAt <= Date.now()) throw new Error('stale counter');
-        localStorage.setItem(counterKey, counterValue(next + 1, this.config.idleTimeout));
-        if (sharedCounter(localStorage.getItem(counterKey))?.next !== next + 1) throw new Error('counter write failed');
-      } catch {
-        this.rotateIdentity();
-        queueMicrotask(() => { if (!this.destroyed) this.restartCallback?.(); });
-        throw new Error('Replay segment counter freshness is unproven');
-      }
-    }
     this.state.segmentId++;
-    this.persistSession();
     return next;
   }
 
   /** A new identity cannot reuse the previous document's segment sequence. */
   rotateIdentity(): void {
-    if (this.storageKey) {
-      try { sessionStorage.setItem(this.storageKey, ''); } catch { /* No persistent identity remains usable. */ }
-      const counterKey = `${this.storageKey}_${this.state.sessionId}`;
-      try { localStorage.removeItem(counterKey); }
-      catch { try { localStorage.setItem(counterKey, 'invalid'); } catch { /* A later restore still requires lineage proof. */ } }
-    }
-    this.releaseClaim?.();
-    this.releaseClaim = null;
-    this.storageKey = null;
     const now = Date.now();
     this.state = { sessionId: newSessionId(), mode: decideSamplingMode(this.config), startedAt: now, lastActivity: now, segmentId: 0 };
+    this.active = Boolean(this.state.sessionId) && this.isVisible();
     this.ringBuffer.clear();
   }
 
@@ -495,15 +318,13 @@ export class SessionManager {
     }
     if (this.active && now - this.state.lastActivity < this.config.idleTimeout) {
       this.state.lastActivity = now;
-      this.persistSession();
       this.resetIdleTimer();
       return false;
     }
 
     this.rotateIdentity();
-    this.active = true;
-    this.resetIdleTimer();
-    if (this.state.mode !== 'off' && this.restartCallback) {
+    if (this.active) this.resetIdleTimer();
+    if (this.active && this.state.mode !== 'off' && this.restartCallback) {
       try { this.restartCallback(); } catch { /* Never crash the host app */ }
     }
     return true;
@@ -570,8 +391,6 @@ export class SessionManager {
    */
   destroy(): void {
     this.destroyed = true;
-    this.releaseClaim?.();
-    this.releaseClaim = null;
     this.active = false;
     if (this.idleTimer !== null) {
       clearTimeout(this.idleTimer);

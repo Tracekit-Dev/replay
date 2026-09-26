@@ -103,21 +103,22 @@ describe('SessionManager lifecycle', () => {
     manager.destroy();
   });
 
-  it('persists segment allocation and removes all listeners on destroy', async () => {
+  it('allocates in memory and removes all listeners on destroy', async () => {
     useLocks();
     vi.stubGlobal('document', doc);
     vi.stubGlobal('sessionStorage', { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) });
     const manager = new SessionManager(config());
     await manager.ready();
     expect(manager.nextSegmentId()).toBe(0);
-    const key = [...storage.keys()].find((item) => item.startsWith('__tracekit_replay_session_v2_'))!;
-    expect(JSON.parse(storage.get(key)!).segmentId).toBe(1);
+    expect(manager.getState().segmentId).toBe(1);
+    expect(storage.size).toBe(0);
+    expect(sharedCounters.size).toBe(0);
     expect(doc.count('pointerdown')).toBe(1);
     manager.destroy();
     expect(doc.count('pointerdown')).toBe(0);
   });
 
-  it('preserves off sampling and segment state across reload when ownership is proven', async () => {
+  it('starts fresh sampling and a zero counter across reload', async () => {
     useLocks();
     vi.stubGlobal('document', doc);
     vi.stubGlobal('sessionStorage', { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) });
@@ -125,13 +126,15 @@ describe('SessionManager lifecycle', () => {
     await first.ready();
     expect(first.getMode()).toBe('off');
     first.nextSegmentId();
+    const oldId = first.getState().sessionId;
     first.destroy();
     vi.stubGlobal('location', { href: 'http://localhost/replay' });
     vi.stubGlobal('performance', { getEntriesByType: (name: string) => name === 'navigation' ? [{ type: 'reload', name: 'http://localhost/replay' }] : [] });
     const second = new SessionManager({ ...config(), sessionSampleRate: 1 });
     await second.ready();
-    expect(second.getMode()).toBe('off');
-    expect(second.nextSegmentId()).toBe(1);
+    expect(second.getMode()).toBe('session');
+    expect(second.getState().sessionId).not.toBe(oldId);
+    expect(second.nextSegmentId()).toBe(0);
     second.destroy();
   });
 
