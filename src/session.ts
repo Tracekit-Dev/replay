@@ -115,7 +115,7 @@ export class SessionManager {
    * - off mode: discard
    */
   onEvent(event: any, _isCheckout: boolean): void {
-    if (!this.active || !this.isVisible()) return;
+    if (this.destroyed || !this.active || !this.isVisible()) return;
     if (Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
       this.handleIdleTimeout();
       return;
@@ -144,6 +144,7 @@ export class SessionManager {
    * sessions in buffer mode.
    */
   onError(): void {
+    if (this.destroyed) return;
     if (this.active && Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
       this.handleIdleTimeout();
       return;
@@ -212,6 +213,7 @@ export class SessionManager {
 
   /** Current session ID */
   getSessionId(): string {
+    if (this.destroyed) return '';
     if (this.active && Date.now() - this.state.lastActivity >= this.config.idleTimeout) {
       this.handleIdleTimeout();
     }
@@ -244,6 +246,7 @@ export class SessionManager {
 
   /** A new identity cannot reuse the previous document's segment sequence. */
   rotateIdentity(): void {
+    if (this.destroyed) return;
     const now = Date.now();
     this.state = { sessionId: newSessionId(), mode: decideSamplingMode(this.config), startedAt: now, lastActivity: now, segmentId: 0 };
     this.active = Boolean(this.state.sessionId) && this.isVisible();
@@ -288,6 +291,7 @@ export class SessionManager {
   }
 
   private handleIdleTimeout(): void {
+    if (this.destroyed) return;
     if (!this.active || Date.now() - this.state.lastActivity < this.config.idleTimeout) {
       if (this.active) this.resetIdleTimer();
       return;
@@ -311,6 +315,7 @@ export class SessionManager {
   }
 
   private renewFromVisibleActivity(): boolean {
+    if (this.destroyed) return false;
     if (!this.isVisible()) return false;
     const now = Date.now();
     if (this.active && now - this.state.lastActivity >= this.config.idleTimeout) {
@@ -344,6 +349,7 @@ export class SessionManager {
     }
 
     this.visibilityHandler = () => {
+      if (this.destroyed) return;
       if (document.visibilityState === 'hidden') {
         // Pause: flush pending events and stop recording
         if (this.pauseCallback) {
@@ -374,6 +380,7 @@ export class SessionManager {
     const names = ['pointerdown', 'pointerup', 'keydown', 'touchstart', 'touchend', 'wheel', 'click', 'input', 'change', 'submit'];
     for (const name of names) {
       const handler = (event: Event) => {
+        if (this.destroyed) return;
         if ((event as Event & { isTrusted?: boolean }).isTrusted === false) return;
         this.renewFromVisibleActivity();
       };

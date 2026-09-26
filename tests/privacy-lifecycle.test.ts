@@ -57,6 +57,8 @@ describe('Replay privacy lifecycle', () => {
   });
 
   it('stops synchronously, rejects late events, and starts with a fresh identity', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
     const host = client();
     const replay = replayIntegration({ sessionSampleRate: 1 });
     replay.install(host);
@@ -68,12 +70,26 @@ describe('Replay privacy lifecycle', () => {
     expect(host.listeners.size).toBe(0);
     expect(replay.getSessionId()).toBe('');
     lateEmit({ type: 2, timestamp: Date.now() }, false);
+    replay.flush();
+    expect(fetchMock).not.toHaveBeenCalled();
     replay.stop();
     expect(recorder.stops).toBe(1);
     replay.start();
     await vi.waitFor(() => expect(recorder.starts).toBe(2));
     expect(replay.getSessionId()).not.toBe(oldId);
     expect(host.listeners.size).toBe(1);
+    replay.teardown?.();
+  });
+
+  it('blocks recorder startup when stop precedes identity readiness', async () => {
+    const host = client();
+    const replay = replayIntegration({ sessionSampleRate: 1 });
+    replay.install(host);
+    replay.stop();
+    await Promise.resolve();
+    expect(recorder.starts).toBe(0);
+    expect(host.listeners.size).toBe(0);
+    expect(replay.getSessionId()).toBe('');
     replay.teardown?.();
   });
 
@@ -132,5 +148,18 @@ describe('Replay privacy lifecycle', () => {
     expect(recorder.stops).toBe(1);
     expect(second.getSessionId()).not.toBe(oldId);
     second.teardown?.();
+  });
+
+  it('cleans a partially installed bridge when subscription fails', async () => {
+    const host = client();
+    const original = host.captureException;
+    host.scope.subscribeBreadcrumb = () => { throw new Error('subscription failed'); };
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const replay = replayIntegration({ sessionSampleRate: 1 });
+    replay.install(host);
+    await vi.waitFor(() => expect(warning).toHaveBeenCalled());
+    expect(host.captureException).toBe(original);
+    expect(replay.getSessionId()).toBe('');
+    replay.teardown?.();
   });
 });

@@ -1,24 +1,5 @@
-/**
- * TraceKit Replay - Public API
- * @package @tracekit/replay
- *
- * Entry point for the session replay addon.
- * Provides replayIntegration() factory that returns an Integration object
- * compatible with @tracekit/browser's addons system.
- *
- * Usage:
- *   import { init } from '@tracekit/browser';
- *   import { replayIntegration } from '@tracekit/replay';
- *   init({ apiKey: 'key', addons: [replayIntegration()] });
- *
- * The integration wires together:
- *   recorder -> session manager -> compression worker -> transport
- *
- * Recording starts immediately when the integration is installed via init().
- * Manual control: flush() forces an upload, getSessionId() returns the current ID.
- */
-
-import type { ReplayConfig, ResolvedReplayConfig, Integration } from './types';
+/** Privacy-gated Replay integration for @tracekit/browser. */
+import type { ReplayConfig, ResolvedReplayConfig, ReplayIntegration } from './types';
 import { resolveReplayConfig } from './config';
 import { record } from 'rrweb';
 import { startRecording } from './recorder';
@@ -26,274 +7,218 @@ import { SessionManager } from './session';
 import { CompressionWorker } from './compression';
 import { ReplayTransport } from './transport';
 
-/**
- * Create a session replay integration for @tracekit/browser.
- *
- * @param config - Optional replay configuration overrides
- * @returns Integration object with flush() and getSessionId() manual control methods
- */
-export function replayIntegration(
-  config: ReplayConfig = {},
-): Integration & { flush(): void; getSessionId(): string } {
+/** The host owns consent and reinitializes Browser after consent changes. */
+export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration {
+  let client: any = null;
   let session: SessionManager | null = null;
-  let compressionWorker: CompressionWorker | null = null;
+  let worker: CompressionWorker | null = null;
   let transport: ReplayTransport | null = null;
-  let stopRecording: (() => void) | null = null;
-  let resolvedConfig: ResolvedReplayConfig | null = null;
+  let stopRecorder: (() => void) | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let previousCapture: ((error: Error, context?: any) => string) | null = null;
+  let captureWrapper: ((error: Error, context?: any) => string) | null = null;
+  let generation = 0;
+  let manuallyStopped = false;
+  let missingBreadcrumbReported = false;
 
-  const integration: Integration & { flush(): void; getSessionId(): string } = {
-    name: 'replay',
-
-    /**
-     * Install the replay integration into the BrowserClient.
-     * Creates the full recording pipeline and starts recording immediately.
-     *
-     * ALL code is wrapped in try/catch -- if replay fails to initialize,
-     * it MUST NOT break the host app or the core browser SDK.
-     */
-    install(client: any): void {
-      try {
-        // Resolve config with client's apiKey and endpoint
-        const clientConfig = client.getConfig();
-        resolvedConfig = {
-          ...resolveReplayConfig(config, clientConfig.apiKey, clientConfig.endpoint),
-          serviceName: clientConfig.serviceName || '',
-        };
-        const ownedConfig = resolvedConfig;
-
-        // Create session manager (makes sampling decision)
-        session = new SessionManager(ownedConfig);
-        const ownedSession = session;
-        void ownedSession.ready().then(() => {
-          if (session !== ownedSession) return;
-          try {
-
-        // Create compression worker (Web Worker with main-thread fallback)
-        compressionWorker = new CompressionWorker();
-
-        // Create transport (30-second flush interval, retry, sendBeacon fallback)
-        transport = new ReplayTransport(ownedConfig, compressionWorker);
-
-        const currentUserId = (): string => {
-          try { return client.getScope().getUser()?.id || ''; }
-          catch { return ''; }
-        };
-        let recordingUserId = currentUserId();
-        let rotatingUser = false;
-
-        const start = () => {
-          if (!session || !resolvedConfig || !session.isActive() || !session.isVisible() || session.getMode() === 'off') return;
-          if (stopRecording) return;
-          if (currentUserId() !== recordingUserId) {
-            transport?.flush().catch(() => {});
-            session.rotateIdentity();
-            recordingUserId = currentUserId();
-          }
-          if (session.getMode() === 'off' || !session.getSessionId()) return;
-          transport!.startRecordingWindow();
-          stopRecording = startRecording(ownedConfig, (event, isCheckout) => {
-            if (rotatingUser) return;
-            if (currentUserId() !== recordingUserId) {
-              ensureUserBoundary();
-              return; // The new recorder supplies a full snapshot for the new user.
-            }
-            session?.onEvent(event, isCheckout);
-          });
-          if (!stopRecording) transport!.stopRecordingWindow();
-        };
-        const stop = () => {
-          if (stopRecording) {
-            stopRecording();
-            stopRecording = null;
-          }
-          transport?.stopRecordingWindow();
-        };
-        const ensureUserBoundary = () => {
-          if (!session || rotatingUser || currentUserId() === recordingUserId) return;
-          rotatingUser = true;
-          try {
-            stop();
-            transport?.flush().catch(() => {}); // Captures old ID and user before rotation.
-            session.rotateIdentity();
-            recordingUserId = currentUserId();
-          } finally { rotatingUser = false; }
-          start();
-        };
-
-        // Wire session -> transport: events flow from session to transport
-        session.setEventCallback((events: any[]) => {
-          for (const event of events) {
-            transport!.addEvent(event);
-          }
-        });
-
-        // Wire error notification: hook into captureException to detect errors
-        // for ring buffer flush. Also injects replay_id as a tag on the error event
-        // so the playback UI can link errors to their replay session.
-        // Uses setTag (not setExtra) so replay_id appears as a direct span attribute
-        // in OTLP output -- extras would prefix it as "extra.replay_id".
-        const originalCaptureException = client.captureException.bind(client);
-        client.captureException = function (error: Error, context?: any): string {
-          ensureUserBoundary();
-          const replayId = session?.getSessionId() ?? '';
-          const scope = client.getScope();
-          if (replayId) {
-            scope.setTag('replay_id', replayId);
-          }
-          const result = originalCaptureException(error, context);
-          if (replayId) {
-            scope.setTag('replay_id', '');
-          }
-          if (session) {
-            session.onError();
-          }
-          return result;
-        };
-
-        // Bridge breadcrumbs to rrweb custom events for playback sidebar tabs.
-        // Network requests become 'network-request' events, console output becomes
-        // 'console-log' events -- both timestamped in the rrweb event stream.
-        const scope = client.getScope();
-        scope.onBreadcrumb((crumb: any) => {
-          try {
-            if (crumb.type === 'http' || crumb.category?.startsWith('fetch') || crumb.category?.startsWith('xhr')) {
-              record.addCustomEvent('network-request', {
-                method: crumb.data?.method || 'GET',
-                url: crumb.data?.url || crumb.message || '',
-                status: crumb.data?.status_code,
-                duration: crumb.data?.duration,
-                error: crumb.data?.error,
-                traceparent: crumb.data?.traceparent,
-              });
-            } else if (crumb.type === 'console' || crumb.category?.startsWith('console.')) {
-              // Console tab requires expandable objects and stack traces for errors
-              const payload: Record<string, unknown> = {
-                level: crumb.category?.replace('console.', '') || 'log',
-                message: crumb.message || '',
-              };
-              // Include structured data from console args (objects, arrays)
-              if (crumb.data && Object.keys(crumb.data).length > 0) {
-                payload.data = crumb.data;
-              }
-              // Include stack trace for error-level console entries
-              if ((crumb.category === 'console.error' || crumb.category === 'console.warn') && crumb.data?.stack) {
-                payload.stack = crumb.data.stack;
-              }
-              record.addCustomEvent('console-log', payload);
-            }
-          } catch {
-            // Never crash the host app
-          }
-        });
-
-        // Wire idle timeout: flush pending events when session goes idle
-        session.setFlushCallback(() => {
-          transport?.flush().catch(() => {
-            // Never crash on flush errors
-          });
-        });
-
-        // Wire idle timeout restart: stop recording, start fresh with new snapshot
-        session.setRestartCallback(() => {
-          stop();
-          start();
-        });
-
-        session.setIdleStopCallback(() => {
-          stop();
-        });
-
-        // Wire visibility pause: stop recording and flush sync on tab hide
-        session.setPauseCallback(() => {
-          if (stopRecording) {
-            stop();
-          }
-          transport?.flushSync();
-        });
-
-        // Wire visibility resume: restart recording on tab show
-        session.setResumeCallback(() => {
-          start();
-        });
-
-        // Start transport (30-second flush interval)
-        transport.start(
-          () => session!.getFlushSessionId(),
-          () => session!.nextSegmentId(),
-          () => session!.getMode(),
-          // URL: current page location
-          () => typeof window !== 'undefined' ? window.location.href : '',
-          // User ID: from browser SDK scope
-          () => recordingUserId,
-          () => session!.getState().lastActivity + ownedConfig.idleTimeout,
-        );
-
-        // Start recording immediately (LOCKED: recording starts on init())
-        start();
-          } catch (err) {
-            console.warn('[TraceKit Replay] Failed to initialize replay recording:', err);
-            integration.teardown?.();
-          }
-        }).catch((err) => {
-          console.warn('[TraceKit Replay] Failed to establish replay identity:', err);
-          integration.teardown?.();
-        });
-      } catch (err) {
-        console.warn('[TraceKit Replay] Failed to initialize replay recording:', err);
-      }
-    },
-
-    /**
-     * Teardown: clean up all resources.
-     * Called when the BrowserClient is destroyed.
-     */
-    teardown(): void {
-      try {
-        if (stopRecording) {
-          stopRecording();
-          stopRecording = null;
-          transport?.stopRecordingWindow();
-        } else {
-          transport?.stopRecordingWindow();
-        }
-        transport?.destroy();
-        compressionWorker?.destroy();
-        session?.destroy();
-        session = null;
-        compressionWorker = null;
-        transport = null;
-        resolvedConfig = null;
-      } catch {
-        // Ignore teardown errors
-      }
-    },
-
-    /**
-     * Manual flush: force an immediate upload of pending events.
-     * Useful for ensuring data is sent before a page transition.
-     */
-    flush(): void {
-      try {
-        transport?.flush().catch(() => {
-          // Never crash
-        });
-      } catch {
-        // Never crash
-      }
-    },
-
-    /**
-     * Get the current session ID.
-     * Returns empty string if replay is not active.
-     * Useful for linking errors to replay sessions (Phase 26).
-     */
-    getSessionId(): string {
-      return session?.getPageviewSessionId() ?? '';
-    },
+  const enabled = () => {
+    try { return client?.getConfig()?.enabled !== false; }
+    catch { return false; }
+  };
+  const current = (token: number) => token === generation && !manuallyStopped && !!session && enabled();
+  const currentUserId = (): string => {
+    try { return client?.getScope()?.getUser()?.id || ''; }
+    catch { return ''; }
   };
 
+  const closeRecorder = () => {
+    const close = stopRecorder;
+    stopRecorder = null;
+    try { close?.(); } catch { /* Never crash the host */ }
+    transport?.stopRecordingWindow();
+  };
+
+  const removeOwnedBridge = () => {
+    try { unsubscribe?.(); } catch { /* Never crash the host */ }
+    unsubscribe = null;
+    if (client && captureWrapper && client.captureException === captureWrapper && previousCapture) {
+      client.captureException = previousCapture;
+    }
+    captureWrapper = null;
+    previousCapture = null;
+  };
+
+  const discard = () => {
+    generation++;
+    closeRecorder();
+    removeOwnedBridge();
+    transport?.destroy();
+    worker?.destroy();
+    session?.destroy();
+    transport = null;
+    worker = null;
+    session = null;
+  };
+
+  const activate = () => {
+    if (!client || !enabled() || session) return;
+    const token = ++generation;
+    try {
+      const browserConfig = client.getConfig();
+      const replayConfig: ResolvedReplayConfig = {
+        ...resolveReplayConfig(config, browserConfig.apiKey, browserConfig.endpoint),
+        serviceName: browserConfig.serviceName || '',
+      };
+      // Allocate synchronously. Browser's initial pageview reads this ID after install().
+      const ownedSession = new SessionManager(replayConfig);
+      session = ownedSession;
+      void ownedSession.ready().then(() => {
+        if (!current(token) || session !== ownedSession) return;
+        try {
+          worker = new CompressionWorker();
+          transport = new ReplayTransport(replayConfig, worker);
+          let recordingUserId = currentUserId();
+          let rotatingUser = false;
+
+          const beginRecorder = () => {
+            if (!current(token) || !ownedSession.isActive() || !ownedSession.isVisible() || ownedSession.getMode() === 'off' || stopRecorder) return;
+            if (currentUserId() !== recordingUserId) { boundary(); return; }
+            transport?.startRecordingWindow();
+            stopRecorder = startRecording(replayConfig, (event, checkout) => {
+              if (!current(token) || rotatingUser || session !== ownedSession) return;
+              if (currentUserId() !== recordingUserId) { boundary(); return; }
+              ownedSession.onEvent(event, checkout);
+            });
+            if (!stopRecorder) transport?.stopRecordingWindow();
+          };
+
+          const boundary = () => {
+            if (!current(token) || rotatingUser || currentUserId() === recordingUserId) return;
+            rotatingUser = true;
+            try {
+              closeRecorder();
+              void transport?.flush().catch(() => {});
+              ownedSession.rotateIdentity();
+              recordingUserId = currentUserId();
+            } finally { rotatingUser = false; }
+            beginRecorder();
+          };
+
+          ownedSession.setEventCallback((events) => {
+            if (!current(token)) return;
+            for (const event of events) transport?.addEvent(event);
+          });
+          ownedSession.setFlushCallback(() => { if (current(token)) void transport?.flush().catch(() => {}); });
+          ownedSession.setRestartCallback(() => { if (current(token)) { closeRecorder(); beginRecorder(); } });
+          ownedSession.setIdleStopCallback(() => { if (current(token)) closeRecorder(); });
+          ownedSession.setPauseCallback(() => {
+            if (!current(token)) return;
+            closeRecorder();
+            transport?.flushSync();
+          });
+          ownedSession.setResumeCallback(() => { if (current(token)) beginRecorder(); });
+
+          previousCapture = client.captureException;
+          const ownedPrevious = previousCapture;
+          const ownedClient = client;
+          captureWrapper = function (error: Error, context?: any): string {
+            if (!current(token) || !ownedPrevious) return ownedPrevious?.call(ownedClient, error, context) ?? '';
+            boundary();
+            const replayId = ownedSession.getSessionId();
+            const scope = ownedClient.getScope();
+            const tags = scope.getTags?.() ?? {};
+            const hadTag = Object.prototype.hasOwnProperty.call(tags, 'replay_id');
+            const priorTag = tags.replay_id ?? '';
+            try {
+              if (replayId) scope.setTag('replay_id', replayId);
+              return ownedPrevious.call(ownedClient, error, context);
+            } finally {
+              if (replayId) {
+                if (hadTag || typeof scope.removeTag !== 'function') scope.setTag('replay_id', priorTag);
+                else scope.removeTag('replay_id');
+              }
+              if (current(token)) ownedSession.onError();
+            }
+          };
+          client.captureException = captureWrapper;
+
+          const scope = client.getScope();
+          if (typeof scope.subscribeBreadcrumb === 'function') {
+            unsubscribe = scope.subscribeBreadcrumb((crumb: any) => {
+              if (!current(token)) return;
+              try {
+                if (crumb.type === 'http' || crumb.category?.startsWith('fetch') || crumb.category?.startsWith('xhr')) {
+                  record.addCustomEvent('network-request', {
+                    method: crumb.data?.method || 'GET', url: crumb.data?.url || crumb.message || '',
+                    status: crumb.data?.status_code, duration: crumb.data?.duration,
+                    error: crumb.data?.error, traceparent: crumb.data?.traceparent,
+                  });
+                } else if (crumb.type === 'console' || crumb.category?.startsWith('console.')) {
+                  const payload: Record<string, unknown> = { level: crumb.category?.replace('console.', '') || 'log', message: crumb.message || '' };
+                  if (crumb.data && Object.keys(crumb.data).length > 0) payload.data = crumb.data;
+                  if ((crumb.category === 'console.error' || crumb.category === 'console.warn') && crumb.data?.stack) payload.stack = crumb.data.stack;
+                  record.addCustomEvent('console-log', payload);
+                }
+              } catch { /* Never crash the host */ }
+            });
+          } else if (!missingBreadcrumbReported) {
+            missingBreadcrumbReported = true;
+            console.warn('[TraceKit Replay] Breadcrumb capture unavailable: Browser subscription bridge is missing.');
+          }
+
+          transport.start(
+            () => ownedSession.getFlushSessionId(), () => ownedSession.nextSegmentId(),
+            () => ownedSession.getMode(),
+            () => typeof window !== 'undefined' ? window.location.href : '',
+            () => recordingUserId,
+            () => ownedSession.getState().lastActivity + replayConfig.idleTimeout,
+          );
+          beginRecorder();
+        } catch (error) {
+          console.warn('[TraceKit Replay] Failed to initialize replay recording:', error);
+          discard();
+        }
+      }).catch((error) => {
+        console.warn('[TraceKit Replay] Failed to establish replay identity:', error);
+        discard();
+      });
+    } catch (error) {
+      console.warn('[TraceKit Replay] Failed to initialize replay recording:', error);
+      discard();
+    }
+  };
+
+  const integration: ReplayIntegration = {
+    name: 'replay',
+    install(browserClient: any): void {
+      if (client && client !== browserClient) discard();
+      client = browserClient;
+      manuallyStopped = false;
+      activate();
+    },
+    start(): void {
+      if (!client || !enabled()) return;
+      manuallyStopped = false;
+      activate();
+    },
+    stop(): void {
+      manuallyStopped = true;
+      discard();
+    },
+    teardown(): void {
+      manuallyStopped = true;
+      discard();
+      client = null;
+    },
+    flush(): void {
+      if (!client || manuallyStopped || !enabled()) return;
+      try { void transport?.flush().catch(() => {}); } catch { /* Never crash the host */ }
+    },
+    getSessionId(): string {
+      return !manuallyStopped && enabled() ? session?.getPageviewSessionId() ?? '' : '';
+    },
+  };
   return integration;
 }
 
-// Re-export types for consumers
-export type { ReplayConfig, Integration } from './types';
+export type { ReplayConfig, Integration, ReplayIntegration } from './types';

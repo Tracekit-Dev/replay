@@ -18,6 +18,14 @@ export interface Integration {
   teardown?(): void;
 }
 
+/** Manual controls available on the Replay addon instance. */
+export interface ReplayIntegration extends Integration {
+  start(): void;
+  stop(): void;
+  flush(): void;
+  getSessionId(): string;
+}
+
 // ============================================================================
 // Replay Configuration
 // ============================================================================

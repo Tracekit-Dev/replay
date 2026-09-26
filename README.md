@@ -70,7 +70,31 @@ replay.flush();
 
 // Get the current session ID (for linking to errors)
 replay.getSessionId();
+
+// Stop capture and discard unsent replay data after permission withdrawal.
+replay.stop();
+
+// Start a new recording with a fresh Replay ID after permission returns.
+replay.start();
 ```
+
+The host application owns the permission decision. Use the Browser SDK's existing
+`enabled` setting when you initialize it. A disabled client does not create Replay
+recording resources. To withdraw permission, reinitialize the Browser SDK with
+`init({...config, enabled: false})`. That call destroys the prior Replay addon.
+Reinitialize with `enabled: true` and a new Replay addon when permission returns.
+Do not mutate `getConfig().enabled` directly. That mutation does not stop active
+Browser collectors or Replay observers.
+
+`stop()` synchronously stops Replay observers and discards unsent replay data.
+It also aborts active Replay fetches and prevents automatic visibility or input
+events from restarting recording. A request that the server already accepted
+cannot be recalled. `start()` is idempotent and checks Browser enablement.
+Each allowed start after a stop uses a fresh document-local Replay ID.
+
+Replay uses owned breadcrumb subscriptions when the Browser SDK supports them.
+With older Browser bundles, Replay disables breadcrumb capture and reports a
+bounded compatibility reason. It does not replace a host breadcrumb listener.
 
 ## Documentation
 

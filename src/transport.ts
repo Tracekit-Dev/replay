@@ -43,6 +43,9 @@ export class ReplayTransport {
   private bufferSize = 0;
   private recordingWindowStart: number | null = null;
   private recordingDeadlineFn: (() => number) | null = null;
+  private generation = 0;
+  private destroyed = false;
+  private abortController = new AbortController();
 
   // Interaction counters (accumulated across all chunks)
   private clickCount = 0;
@@ -106,6 +109,10 @@ export class ReplayTransport {
    * Destroy the transport: stop + clear all pending events.
    */
   destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.generation++;
+    this.abortController.abort();
     this.stop();
     this.pendingEvents = [];
     this.bufferSize = 0;
@@ -149,6 +156,7 @@ export class ReplayTransport {
    * If buffer exceeds maxBufferSize, oldest events are dropped.
    */
   addEvent(event: any): void {
+    if (this.destroyed) return;
     try {
       // An error buffer begins at its oldest retained event, not recorder start.
       if (this.pendingEvents.length === 0 && this.replayTypeFn?.() === 'buffer' &&
@@ -209,6 +217,8 @@ export class ReplayTransport {
    * Returns silently if no events are pending.
    */
   async flush(): Promise<void> {
+    if (this.destroyed) return;
+    const generation = this.generation;
     this.appendRecordingBoundaries();
     if (this.pendingEvents.length === 0) {
       return;
@@ -234,9 +244,10 @@ export class ReplayTransport {
 
       // Compress via worker (or main-thread fallback)
       const { compressed, originalSize } = await this.compressionWorker.compress(events, segmentId);
+      if (this.destroyed || generation !== this.generation) return;
 
       // Upload with retry
-      await this.uploadWithRetry(sessionId, compressed, originalSize, headers);
+      await this.uploadWithRetry(sessionId, compressed, originalSize, headers, generation);
     } catch {
       // Drop chunk on any unexpected error -- replay data loss is acceptable
     }
@@ -253,6 +264,7 @@ export class ReplayTransport {
    * If both fail, data is lost (acceptable for replay).
    */
   flushSync(): void {
+    if (this.destroyed) return;
     this.appendRecordingBoundaries();
     if (this.pendingEvents.length === 0) {
       return;
@@ -314,6 +326,7 @@ export class ReplayTransport {
           },
           body: blob,
           keepalive: true,
+          signal: this.abortController.signal,
         }).catch(() => {
           // Data loss accepted -- replay is non-critical
         });
@@ -338,15 +351,19 @@ export class ReplayTransport {
     compressed: Uint8Array,
     originalSize: number,
     headers: Record<string, string>,
+    generation: number,
   ): Promise<void> {
     const url = `${this.config.endpoint}/api/replays/${sessionId}/chunks`;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      if (this.destroyed || generation !== this.generation) return;
       try {
         const response = await fetch(url, {
           method: 'POST',
           headers: { ...headers, 'X-Original-Size': String(originalSize) },
           body: compressed as unknown as BodyInit,
+          signal: this.abortController.signal,
         });
+        if (this.destroyed || generation !== this.generation) return;
 
         if (response.ok) {
           return; // Success
@@ -394,6 +411,16 @@ export class ReplayTransport {
    * Promise-based delay for retry backoff.
    */
   private delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    if (this.abortController.signal.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+      const signal = this.abortController.signal;
+      const finish = () => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      signal.addEventListener('abort', finish, { once: true });
+    });
   }
 }
