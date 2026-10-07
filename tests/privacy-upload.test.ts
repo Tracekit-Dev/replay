@@ -130,6 +130,7 @@ describe('Replay privacy upload boundary', () => {
 
     expect(requests).toHaveLength(1);
     const [url, init] = requests[0];
+    expect(init.referrerPolicy).toBe('no-referrer');
     expect(url).not.toContain(CANARY);
     expect(JSON.stringify(init.headers)).not.toContain(CANARY);
     const bytes = new Uint8Array(init.body as ArrayBuffer);
@@ -152,7 +153,7 @@ describe('Replay privacy upload boundary', () => {
       () => 'b'.repeat(32),
       () => 1,
       () => 'session',
-      () => `https://app.example.test/page?q=${CANARY}#fragment`,
+      () => 'https://app.example.test/page',
       () => `user-${CANARY}`,
     );
     transport.addEvent(event());
@@ -165,6 +166,26 @@ describe('Replay privacy upload boundary', () => {
     expect(url).not.toContain('#fragment');
     expect(body.size).toBeGreaterThan(0);
     expect(new TextDecoder().decode(gunzipSync(new Uint8Array(await body.arrayBuffer())))).not.toContain(CANARY);
+    transport.destroy();
+  });
+
+  it('uses no-referrer keepalive instead of beacon when the host URL contains private query data', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+    const beaconMock = vi.fn(() => true);
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('navigator', { sendBeacon: beaconMock, userAgent: 'safe-browser' });
+    const transport = new ReplayTransport(config(), worker());
+    transport.start(() => 'd'.repeat(32), () => 0, () => 'session',
+      () => `https://app.example.test/page?token=${CANARY}#fragment`, () => '');
+    transport.addEvent(event());
+    transport.flushSync();
+    expect(beaconMock).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(init.keepalive).toBe(true);
+    expect(init.referrerPolicy).toBe('no-referrer');
+    expect(url).not.toContain(CANARY);
+    expect(new TextDecoder().decode(gunzipSync(new Uint8Array(await (init.body as Blob).arrayBuffer())))).not.toContain(CANARY);
     transport.destroy();
   });
 
