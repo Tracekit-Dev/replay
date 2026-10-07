@@ -28,37 +28,46 @@ function makeClient(browser, config) {
   }));
 }
 
-async function run() {
+async function run(bridge = false) {
   const directory = mkdtempSync(join(tmpdir(), 'tracekit-replay-browser-compat-'));
   const warnings = [];
   const originalWarn = console.warn;
   console.warn = (...args) => warnings.push(args.join(' '));
   try {
-    const lowest = await loadBundle(packageBundle('0.1.1', directory));
-    const localCurrent = join(process.cwd(), '..', 'browser-phase-187', 'dist', 'index.js');
-    const current = await loadBundle(existsSync(localCurrent) ? localCurrent : packageBundle('0.3.0', directory));
     const replay = await import('../dist/index.js');
-
-    const oldClient = makeClient(lowest);
-    const oldReplay = replay.replayIntegration({ sessionSampleRate: 1 });
-    oldReplay.install(oldClient);
-    if (typeof oldClient.getScope().subscribeBreadcrumb === 'function') {
-      throw new Error('Browser 0.1.1 unexpectedly exposes subscribeBreadcrumb');
+    if (!bridge) {
+      for (const version of ['0.1.1', '0.3.0']) {
+        const released = await loadBundle(packageBundle(version, directory));
+        const client = makeClient(released);
+        const addon = replay.replayIntegration({ sessionSampleRate: 1 });
+        warnings.length = 0;
+        addon.install(client);
+        if (typeof client.getScope().subscribeBreadcrumb === 'function') {
+          throw new Error(`Published Browser ${version} unexpectedly exposes the unreleased bridge`);
+        }
+        if (!warnings.some((warning) => warning.includes('owned Browser subscriptions are unavailable'))) {
+          throw new Error(`Published Browser ${version} did not report bounded fallback`);
+        }
+        addon.teardown?.();
+        client.destroy();
+      }
+      process.stdout.write('PASS: published Browser 0.1.1 and 0.3.0 bounded fallback; no local bridge or sibling substitution\n');
+      return;
     }
-    if (!warnings.some((warning) => warning.includes('owned Browser subscriptions are unavailable'))) {
-      throw new Error('Replay did not report the bounded missing-subscription reason');
+    const explicitModule = process.env.BROWSER_BRIDGE_MODULE;
+    const sourceCommit = process.env.BROWSER_BRIDGE_COMMIT;
+    if (!explicitModule || !existsSync(explicitModule) || !/^[a-f0-9]{40}$/.test(sourceCommit || '')) {
+      throw new Error('Explicit bridge validation requires BROWSER_BRIDGE_MODULE and its exact BROWSER_BRIDGE_COMMIT');
     }
-    oldReplay.teardown?.();
-    oldClient.destroy();
-
+    const current = await loadBundle(explicitModule);
     const currentClient = makeClient(current);
     if (typeof currentClient.getScope().subscribeBreadcrumb !== 'function') {
-      throw new Error('Browser 0.3.0 does not expose subscribeBreadcrumb');
+      throw new Error(`Explicit local Browser source ${sourceCommit} does not expose subscribeBreadcrumb`);
     }
     const currentReplay = replay.replayIntegration({ sessionSampleRate: 1 });
     currentReplay.install(currentClient);
 
-    process.stdout.write('PASS: Browser 0.1.1 bounded bridge fallback and Browser 0.3.0 subscription bridge\n');
+    process.stdout.write(`PASS: explicit unpublished local Browser subscription bridge, source ${sourceCommit}\n`);
     currentReplay.teardown?.();
     currentClient.destroy();
   } finally {
@@ -70,12 +79,12 @@ async function run() {
 if (process.env.VITEST) {
   const { describe, it } = await import('vitest');
   describe('Browser bundle compatibility', () => {
-    it('supports the lowest bundle fallback and current bridge', async () => {
+    it('supports actual published bundle fallback without local siblings', async () => {
       await run();
     });
   });
 } else if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  await run();
+  await run(process.argv.includes('--bridge'));
 }
 
 export { run };
