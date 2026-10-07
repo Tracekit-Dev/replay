@@ -588,7 +588,12 @@ export class ReplayTransport {
       }
 
       // Build URL with query parameters (sendBeacon cannot set custom headers)
-      const replayUrl = sanitizeReplayUrl(this.urlFn ? this.urlFn() : '');
+      const sourceUrl = this.urlFn ? this.urlFn() : '';
+      const replayUrl = sanitizeReplayUrl(sourceUrl);
+      // sendBeacon cannot set a per-request referrer policy. A private host URL
+      // therefore uses keepalive fetch instead of inheriting the page's Referer.
+      const automaticReferrer = typeof location !== 'undefined' ? location.href : sourceUrl;
+      const beaconReferrerSafe = automaticReferrer === sanitizeReplayUrl(automaticReferrer);
       const replayUserId = sanitizeMetadataValue(allocation.userId);
       const serviceName = this.boundedServiceName();
       const url =
@@ -612,7 +617,7 @@ export class ReplayTransport {
       }
 
       // Try sendBeacon first (works during page unload)
-      if (compressed.byteLength <= BEACON_SIZE_LIMIT && typeof navigator !== 'undefined' && navigator.sendBeacon) {
+      if (beaconReferrerSafe && compressed.byteLength <= BEACON_SIZE_LIMIT && typeof navigator !== 'undefined' && navigator.sendBeacon) {
         const sent = navigator.sendBeacon(url, blob);
         if (sent) {
           this.outcome('unknown', 'beacon_queued');
@@ -633,6 +638,7 @@ export class ReplayTransport {
           },
           body: blob,
           keepalive: true,
+          referrerPolicy: 'no-referrer',
         }).catch(() => {
           // Data loss accepted -- replay is non-critical
         });
@@ -688,6 +694,7 @@ export class ReplayTransport {
           method: 'POST',
           headers: { ...headers, 'X-Original-Size': String(originalSize) },
           body: compressed as unknown as BodyInit,
+          referrerPolicy: 'no-referrer',
           ...(controller ? { signal: controller.signal } : {}),
         });
         if (controller) timeout = setTimeout(() => controller.abort(), this.config.fetchTimeoutMs);

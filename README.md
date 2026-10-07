@@ -110,6 +110,23 @@ The viewer marks unsupported legacy intervals and starts again at a real FullSna
 It does not display a known-wrong frame across a missing chunk.
 The viewer labels each unreconstructable interval as a gap.
 
+Replay fetch uploads and retries use `referrerPolicy: 'no-referrer'`.
+During unload, Replay uses `sendBeacon` only when the actual host URL needs no sanitization.
+A host URL with query data, a fragment, credentials, or another removed URL component uses
+`fetch` with `keepalive: true` and `referrerPolicy: 'no-referrer'` instead.
+Replay does not change the host page's global referrer policy.
+Neither unload transport guarantees server acknowledgement.
+
+Initial capture serializes the current document synchronously. The fixed 10,000-node
+fixture measured one 303 ms startup task at 4x CPU throttling. Its steady input latency
+met the unchanged 10 ms added p95 limit. This is not a zero-blocking startup guarantee.
+When delayed capture is acceptable, schedule the host's initial Browser `init` with
+the Replay addon through `requestIdleCallback`. Use a host-selected timeout or
+`setTimeout` fallback. A timeout can still interrupt active work, and delayed capture
+misses earlier events. Exclude unnecessary subtrees with rrweb's supported `.rr-block`
+class. That exclusion also removes their playback detail. These mitigations require
+measurement on the host's real document; the fixed fixture does not measure their benefit.
+
 Replay uses owned breadcrumb subscriptions when the Browser SDK supports them.
 With older Browser bundles, Replay disables breadcrumb capture and reports a
 bounded compatibility reason. It does not replace a host breadcrumb listener.

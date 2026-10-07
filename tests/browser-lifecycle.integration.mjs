@@ -105,7 +105,7 @@ try {
     try {
       console.error(`starting ${engine}`);
       browser = await playwright[engine].launch({ timeout: 20_000, headless: engine === 'firefox' || process.env.LIFECYCLE_HEADLESS === '1',
-        ...(engine === 'chromium' ? { ignoreDefaultArgs: ['--disable-back-forward-cache'] } : {}) });
+        ...(engine === 'chromium' ? { ignoreDefaultArgs: ['--disable-back-forward-cache', '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding'] } : {}) });
     } catch (error) {
       outcomes.push({ engine, state: 'unavailable', reason: error.message.slice(0, 1000) });
       console.error(`${engine}: unavailable`);
@@ -187,17 +187,29 @@ try {
         assert.ok(await page.evaluate(() => replay.getSessionId()));
         return true;
       });
+      const beforeNavigationID = await page.evaluate(() => {
+        const originalNow = Date.now.bind(Date);
+        Date.now = () => originalNow() + Number(sessionStorage.getItem('fixture-elapsed-ms') || 0);
+        return replay.getSessionId();
+      });
       await page.goto(origin + '/away');
       outcome.pagehide = Boolean(await check('real pagehide', async () => {
         assert.ok(await page.evaluate(() => sessionStorage.getItem('fixture-pagehide')));
         return true;
       }));
+      await page.evaluate(() => sessionStorage.setItem('fixture-elapsed-ms', String(800 * 60 * 1000)));
       await page.goBack({ waitUntil: 'commit' });
       await page.waitForFunction(() => Array.isArray(window.lifecycleEvents));
       const restored = await page.evaluate(() => lifecycleEvents.some((event) => event.type === 'pageshow' && event.persisted));
       outcome.backForwardCache = restored;
       outcome.checks.push({ name: 'real back-forward cache restore', state: restored ? 'pass' : 'release_gap',
         detail: restored ? await page.evaluate(() => ({ events: lifecycleEvents, session: replay.getSessionId() })) : 'navigation reloaded; no persisted pageshow in this runner' });
+      if (restored) await check('800-minute pagehide and cache resume', async () => {
+        await page.click('#action');
+        const resumedID = await page.evaluate(() => replay.getSessionId());
+        assert.ok(resumedID && resumedID !== beforeNavigationID, 'cached documents must not reuse an idle recording');
+        return { elapsedMs: 800 * 60 * 1000, lifecycle: 'real pagehide/pageshow', clock: 'controlled Date.now offset' };
+      });
       await page.close();
       const blockedContext = await browser.newContext();
       await blockedContext.addInitScript(() => {
@@ -212,27 +224,42 @@ try {
         return true;
       }));
       await blockedContext.close();
-      await check('all serialized transport privacy bytes', async () => {
-        const modes = ['fetch', 'retry', 'beacon', 'keepalive'];
-        const inspected = {};
-        for (const mode of modes) {
+      for (const mode of ['fetch', 'retry', 'beacon', 'private-unload', 'keepalive']) {
+        await check(`${mode} serialized transport privacy bytes`, async () => {
           const transportPage = await realPage(context, engine);
-          if (mode === 'keepalive') await transportPage.addInitScript(() => { navigator.sendBeacon = () => false; });
-          await transportPage.goto(`${origin}/?token=url-query-canary#fragment-canary`);
+          const calls = [];
+          await transportPage.exposeBinding('__fixtureTransport', (_, call) => calls.push(call));
+          await transportPage.addInitScript((forceFallback) => {
+            const record = call => {
+              const prior = JSON.parse(sessionStorage.getItem('fixture-transport-calls') || '[]');
+              prior.push(call);
+              sessionStorage.setItem('fixture-transport-calls', JSON.stringify(prior));
+            };
+            if (location.pathname !== '/away') sessionStorage.removeItem('fixture-transport-calls');
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = (url, options) => {
+              if (String(url).includes('/api/replays/')) record({ api: 'fetch', keepalive: Boolean(options?.keepalive), referrerPolicy: options?.referrerPolicy });
+              return originalFetch(url, options);
+            };
+            const originalBeacon = navigator.sendBeacon.bind(navigator);
+            navigator.sendBeacon = (url, body) => {
+              const accepted = forceFallback ? false : originalBeacon(url, body);
+              record({ api: 'beacon', accepted });
+              return accepted;
+            };
+          }, mode === 'keepalive');
+          await transportPage.goto(mode === 'beacon' || mode === 'keepalive' ? origin : `${origin}/?token=url-query-canary#fragment-canary`);
           await transportPage.bringToFront();
           const key = `${engine}-${mode}`;
           await transportPage.evaluate((name) => boot(name), key);
           await sleep(50);
           if (mode === 'fetch' || mode === 'retry') await transportPage.evaluate(() => replay.flush());
           else {
-            const foreground = await realPage(context, engine);
-            await foreground.goto(origin + '/away');
-            await foreground.bringToFront();
-            await sleep(100);
-            assert.equal(await transportPage.evaluate(() => document.visibilityState), 'hidden', 'sync transports need a real hidden document');
-            await foreground.close();
+            // Actual navigation runs pagehide and delivers bytes to the local HTTP receiver.
+            await transportPage.goto(origin + '/away');
           }
           await waitFor(() => uploads.filter((upload) => upload.mode === key).length >= (mode === 'retry' ? 2 : 1), `${key} actual HTTP request`);
+          calls.push(...await transportPage.evaluate(() => JSON.parse(sessionStorage.getItem('fixture-transport-calls') || '[]')));
           const emitted = uploads.filter((upload) => upload.mode === key);
           for (const upload of emitted) {
             assert.doesNotMatch(JSON.stringify(upload), /private-form-canary|url-query-canary|fragment-canary|attribute-canary|console-object-canary|console-message-canary|private-text-canary|hidden-mutation-canary/);
@@ -242,13 +269,19 @@ try {
             assert.ok(boundaries[1].timestamp - boundaries[0].timestamp <= 2000, 'hidden time must not inflate recorded duration');
           }
           if (mode === 'retry') assert.deepEqual(emitted[0].events, emitted[1].events, 'retry bytes preserve immutable events');
-          if (mode === 'beacon' || mode === 'keepalive') assert.ok(emitted.some((upload) => upload.url.includes('segment_id=')));
-          inspected[mode] = { requests: emitted.length, decodedEvents: emitted.reduce((sum, upload) => sum + upload.events.length, 0) };
-          await transportPage.evaluate(() => replay.teardown());
+          if (mode === 'beacon') assert.ok(calls.some(call => call.api === 'beacon' && call.accepted), 'safe URLs must retain actual beacon delivery');
+          if (mode === 'private-unload') {
+            assert.ok(!calls.some(call => call.api === 'beacon'), 'private host URLs must bypass automatic beacon Referer');
+            assert.ok(calls.some(call => call.api === 'fetch' && call.keepalive && call.referrerPolicy === 'no-referrer'));
+          }
+          if (mode === 'keepalive') assert.ok(calls.some(call => call.api === 'fetch' && call.keepalive && call.referrerPolicy === 'no-referrer'));
+          if (mode === 'fetch' || mode === 'retry') assert.ok(calls.filter(call => call.api === 'fetch').every(call => call.referrerPolicy === 'no-referrer'));
+          const detail = { requests: emitted.length, decodedEvents: emitted.reduce((sum, upload) => sum + upload.events.length, 0), calls };
+          await transportPage.evaluate(() => window.replay?.teardown());
           await transportPage.close();
-        }
-        return inspected;
-      });
+          return detail;
+        });
+      }
       await context.close();
       outcome.state = outcome.checks.some((item) => item.state === 'fail') ? 'fail'
         : outcome.checks.some((item) => item.state === 'release_gap') ? 'release_gap' : 'pass';
