@@ -179,6 +179,20 @@ try {
       }
       await backgroundTab.close();
       await page.bringToFront();
+      if (engine === 'chromium' && !actuallyHidden) await check('real renderer suspension', async () => {
+        const cdp = await context.newCDPSession(page);
+        await page.evaluate(() => { window.freezeTicks = 0; window.freezeTimer = setInterval(() => freezeTicks++, 10); });
+        const before = await page.evaluate(() => freezeTicks);
+        await cdp.send('Page.setWebLifecycleState', { state: 'frozen' });
+        await sleep(150);
+        await cdp.send('Page.setWebLifecycleState', { state: 'active' });
+        const after = await page.evaluate(() => { clearInterval(freezeTimer); return freezeTicks; });
+        assert.ok(after - before <= 2, `frozen renderer kept executing timers: ${after - before}`);
+        await page.click('#action');
+        assert.ok(await page.evaluate(() => replay.getSessionId()));
+        await cdp.detach();
+        return { method: 'CDP Page.setWebLifecycleState frozen/active', frozenWallMs: 150, executedTimerTicks: after - before };
+      });
       await check('manual stop survives trusted input and visibility', async () => {
         await page.evaluate(() => replay.stop());
         await page.click('#action');
