@@ -24,6 +24,7 @@
   ],
   "scripts": {
     "build": "tsup",
+    "pretest": "npm run build",
     "test": "vitest run tests",
     "test:browser-lifecycle": "node tests/browser-lifecycle.integration.mjs --full",
     "dev": "tsup --watch"
