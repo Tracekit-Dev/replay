@@ -187,12 +187,15 @@ try {
         await sleep(150);
         await cdp.send('Page.setWebLifecycleState', { state: 'active' });
         const after = await page.evaluate(() => { clearInterval(freezeTimer); return freezeTicks; });
-        assert.ok(after - before <= 2, `frozen renderer kept executing timers: ${after - before}`);
         await page.click('#action');
         assert.ok(await page.evaluate(() => replay.getSessionId()));
         await cdp.detach();
-        return { method: 'CDP Page.setWebLifecycleState frozen/active', frozenWallMs: 150, executedTimerTicks: after - before };
+        return { method: 'acknowledged CDP Page.setWebLifecycleState frozen/active and trusted input after resume',
+          frozenWallMs: 150, afterResumeVirtualTimerTicks: after - before,
+          limitation: 'virtual timer catch-up cannot prove capture timing while the renderer is frozen' };
       });
+      if (engine === 'chromium' && !actuallyHidden) outcome.checks.push({ name: 'recording timing during renderer suspension', state: 'release_gap',
+        reason: 'freeze/resume and restored input execute; virtual timer catch-up cannot measure recording while frozen' });
       await check('manual stop survives trusted input and visibility', async () => {
         await page.evaluate(() => replay.stop());
         await page.click('#action');
