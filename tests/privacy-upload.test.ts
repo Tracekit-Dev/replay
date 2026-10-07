@@ -49,6 +49,24 @@ function transport(replayConfig: Parameters<typeof resolveReplayConfig>[0] = {})
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('serialized privacy upload paths', () => {
+  it('keeps a page query out of fetch referrers and skips beacon on page close', async () => {
+    const beacon = vi.fn(() => true);
+    const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => ({ ok: true, status: 201 }));
+    vi.stubGlobal('location', { search: `?token=${canary}` });
+    vi.stubGlobal('navigator', { sendBeacon: beacon });
+    vi.stubGlobal('fetch', fetchMock);
+    const instance = transport();
+    instance.addEvent(removeSnapshot);
+    await instance.flush();
+    expect(fetchMock.mock.calls[0][1].referrerPolicy).toBe('no-referrer');
+    instance.addEvent({ ...removeSnapshot, timestamp: 5 });
+    instance.flushSync();
+    expect(beacon).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.at(-1)?.[1].referrerPolicy).toBe('no-referrer');
+    expect(fetchMock.mock.calls.at(-1)?.[1].keepalive).toBe(true);
+    instance.destroy();
+  });
+
   it.each([
     ['single forged', [{ parentId: 4, id: 2 }]],
     ['valid then forged', [{ parentId: 2, id: 3 }, { parentId: 4, id: 2 }]],

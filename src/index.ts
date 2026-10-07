@@ -32,6 +32,7 @@ export function replayIntegration(config: ReplayConfig = {}): ReplayIntegration 
     const captureState: ReplayStatus['captureState'] = manuallyStopped ? 'stopped' : !client || !enabled() ? 'disabled' :
       transportStatus?.captureState === 'failed' ? 'failed' :
       !session ? 'failed' : state === 'off' ? 'sampled_out' : !session.isVisible() ? 'paused' :
+      !session.isActive() ? 'idle' :
       state === 'buffer' ? 'buffering' : 'recording';
     return { ...transportStatus ?? {
       deliveryState: 'idle', reason: 'none', queueBytes: 0, queueEvents: 0, queueChunks: 0,

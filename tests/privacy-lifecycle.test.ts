@@ -114,6 +114,18 @@ describe('Replay privacy lifecycle', () => {
     replay.teardown?.();
   });
 
+  it('reports idle after capture expires', async () => {
+    vi.useFakeTimers();
+    const host = client();
+    const replay = replayIntegration({ sessionSampleRate: 1, idleTimeout: 1_000, flushInterval: 30_000 });
+    replay.install(host);
+    expect(replay.getStatus().captureState).toBe('recording');
+    await vi.advanceTimersByTimeAsync(1_001);
+    expect(replay.getSessionId()).toBe('');
+    expect(replay.getStatus().captureState).toBe('idle');
+    replay.teardown?.();
+  });
+
   it('keeps a sampled-out identity without starting a recorder', () => {
     const host = client();
     const replay = replayIntegration({ sessionSampleRate: 0, errorSampleRate: 0 });

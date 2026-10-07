@@ -30,7 +30,7 @@ export interface ReplayIntegration extends Integration {
 
 /** Aggregate diagnostics only. Never add URLs, identities, or recorded content. */
 export interface ReplayStatus {
-  captureState: 'recording' | 'buffering' | 'paused' | 'stopped' | 'disabled' | 'sampled_out' | 'failed';
+  captureState: 'recording' | 'buffering' | 'paused' | 'idle' | 'stopped' | 'disabled' | 'sampled_out' | 'failed';
   deliveryState: 'idle' | 'pending' | 'retrying' | 'degraded';
   reason: 'none' | 'snapshot_too_large' | 'queue_limit' | 'compression_failed' | 'compression_timeout' |
     'fetch_timeout' | 'retry_exhausted' | 'terminal_response' | 'beacon_unknown' | 'invalid_scope' |

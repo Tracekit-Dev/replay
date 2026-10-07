@@ -741,7 +741,10 @@ export class ReplayTransport {
       const blob = new Blob([compressed as unknown as BlobPart], { type: 'application/octet-stream' });
 
       // Try sendBeacon first (works during page unload)
-      if (compressed.byteLength <= BEACON_SIZE_LIMIT && typeof navigator !== 'undefined' && navigator.sendBeacon) {
+      // sendBeacon inherits the page Referrer policy and can expose its query.
+      // A keepalive fetch can set a strict policy for pages with query data.
+      const pageHasQuery = typeof location !== 'undefined' && Boolean(location.search);
+      if (!pageHasQuery && compressed.byteLength <= BEACON_SIZE_LIMIT && typeof navigator !== 'undefined' && navigator.sendBeacon) {
         let sent = false;
         try { sent = navigator.sendBeacon(url, blob); } catch { /* Use bounded keepalive fallback. */ }
         if (sent) {
@@ -771,6 +774,7 @@ export class ReplayTransport {
           },
           body: blob,
           keepalive: true,
+          referrerPolicy: 'no-referrer',
           signal: controller.signal,
         }); } catch {
           clearTimeout(timer);
@@ -853,6 +857,7 @@ export class ReplayTransport {
           method: 'POST',
           headers: { ...headers, 'X-Original-Size': String(originalSize) },
           body: compressed as unknown as BodyInit,
+          referrerPolicy: 'no-referrer',
           signal: controller.signal,
         }), deadline]);
         if (this.destroyed || generation !== this.generation) return;
